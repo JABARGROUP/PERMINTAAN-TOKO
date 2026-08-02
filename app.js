@@ -65,7 +65,7 @@ function simpanAdminSecretKey() {
   const input = document.getElementById('adminSecretKeySettingInput');
   const value = input ? input.value.trim() : '';
   saveAdminSecretKey(value);
-  showNotif(value ? 'SECRET KEY SUPABASE BERHASIL DISIMPAN!' : 'SECRET KEY SUPABASE DIHAPUS!', 'info');
+  showNotif(value ? 'SECRET KEY GOOGLE SHEETS BERHASIL DISIMPAN!' : 'SECRET KEY GOOGLE SHEETS DIHAPUS!', 'info');
 }
 
 function getSystemNotifications() {
@@ -394,22 +394,24 @@ let html5QrCodeScanner = null;
 
 // HELPER: GET FORMATTED DATE (DD/MM/YYYY)
 function getFormattedDateDDMMYYYY(dObj = new Date()) {
-  const day = String(dObj.getDate()).padStart(2, '0');
-  const month = String(dObj.getMonth() + 1).padStart(2, '0');
-  const year = dObj.getFullYear();
-  return `${day}/${month}/${year}`;
-}
+  if (dObj instanceof Date) {
+    const day = String(dObj.getDate()).padStart(2, '0');
+    const month = String(dObj.getMonth() + 1).padStart(2, '0');
+    const year = dObj.getFullYear();
+    return `${day}/${month}/${year}`;
+  }
 
-function formatDateDDMMYYYYString(input) {
-  if (!input) return '-';
-  const str = String(input).trim();
+  const str = String(dObj || '').trim();
+  if (!str) return '';
   if (/^\d{2}\/\d{2}\/\d{4}/.test(str)) {
     return str.split(' ')[0];
   }
+
   const match = str.match(/^(\d{4})[-/](\d{2})[-/](\d{2})/);
   if (match) {
     return `${match[3]}/${match[2]}/${match[1]}`;
   }
+
   const d = new Date(str);
   if (!isNaN(d.getTime())) {
     const day = String(d.getDate()).padStart(2, '0');
@@ -417,7 +419,13 @@ function formatDateDDMMYYYYString(input) {
     const year = d.getFullYear();
     return `${day}/${month}/${year}`;
   }
+
   return str;
+}
+
+function formatDateDDMMYYYYString(input) {
+  if (!input) return '-';
+  return getFormattedDateDDMMYYYY(input);
 }
 
 // APP INITIALIZATION
@@ -1122,8 +1130,8 @@ function toggleTheme() {
 }
 
 function updateThemeIcon() {
-  const iconSpans = document.querySelectorAll('.theme-toggle-btn span, .popupThemeToggleBtn span, .theme-icon-btn span, .theme-toggle-inline span');
   const currentIcon = THEME_MODES[currentThemeIndex] ? THEME_MODES[currentThemeIndex].icon : 'palette';
+  const iconSpans = document.querySelectorAll('.theme-icon-btn span');
   iconSpans.forEach(el => {
     if (el) el.textContent = currentIcon;
   });

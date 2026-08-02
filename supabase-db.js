@@ -8,7 +8,7 @@
 const memoryCache = new Map();
 const sessionKey = window.SESSION_KEY || 'STORE_ACTIVE_SESSION_V7_CLEAN';
 const themeKey = window.THEME_KEY || 'STORE_ACTIVE_THEME_V7_CLEAN';
-const ADMIN_SCRIPT_URL_KEY = window.ADMIN_SCRIPT_URL_KEY || 'STORE_ADMIN_SCRIPT_URL_V7_CLEAN';
+const ADMIN_SCRIPT_URL_STORAGE_KEY = window.ADMIN_SCRIPT_URL_KEY || 'STORE_ADMIN_SCRIPT_URL_V7_CLEAN';
 
 let pendingWrites = new Map();
 let writeTimer = null;
@@ -34,7 +34,8 @@ const appStorage = {
   },
 
   setItem(key, value) {
-    const strVal = String(value);
+    const normalizedValue = normalizeDateFields(value);
+    const strVal = typeof normalizedValue === 'string' ? normalizedValue : JSON.stringify(normalizedValue);
     memoryCache.set(key, strVal);
     try {
       // Persist to localStorage ONLY for session (user login/password)
@@ -82,10 +83,51 @@ function parseStorageValue(strVal) {
   try { return JSON.parse(strVal); } catch { return strVal; }
 }
 
+function normalizeDateFields(value) {
+  if (value === null || value === undefined) return value;
+
+  if (typeof value === 'string') {
+    const str = value.trim();
+    if (!str) return '';
+    if (/^\d{2}\/\d{2}\/\d{4}/.test(str)) return str.split(' ')[0];
+
+    const match = str.match(/^(\d{4})[-/](\d{2})[-/](\d{2})/);
+    if (match) {
+      return `${match[3]}/${match[2]}/${match[1]}`;
+    }
+
+    const d = new Date(str);
+    if (!isNaN(d.getTime())) {
+      const day = String(d.getDate()).padStart(2, '0');
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const year = d.getFullYear();
+      return `${day}/${month}/${year}`;
+    }
+
+    return str;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(normalizeDateFields);
+  }
+
+  if (typeof value === 'object') {
+    const out = {};
+    Object.entries(value).forEach(([k, v]) => {
+      const key = String(k || '').toLowerCase();
+      const shouldNormalize = /(tanggal|createdat|updatedat|updated_at|created_at|date)/i.test(key);
+      out[k] = shouldNormalize ? normalizeDateFields(v) : normalizeDateFields(v);
+    });
+    return out;
+  }
+
+  return value;
+}
+
 function serializeForCache(value) {
   if (value === null || value === undefined) return null;
   if (typeof value === 'string') return value;
-  return JSON.stringify(value);
+  return JSON.stringify(normalizeDateFields(value));
 }
 
 function setOnDataChangeCallback(fn) { onDataChangeCallback = fn; }
@@ -118,7 +160,7 @@ function getCloudEndpoint() {
   if (window.APP_SHEETS_SPREADSHEET_ID && window.APP_SHEETS_API_KEY) {
     return { type: 'sheets_api', spreadsheetId: window.APP_SHEETS_SPREADSHEET_ID, apiKey: window.APP_SHEETS_API_KEY };
   }
-  const stored = (appStorage.getItem(ADMIN_SCRIPT_URL_KEY) || '').trim();
+  const stored = (appStorage.getItem(ADMIN_SCRIPT_URL_STORAGE_KEY) || '').trim();
   return stored || null;
 }
 
@@ -149,6 +191,54 @@ async function initSupabaseDB(secretKey = null) {
   }
 }
 
+function mapStorageKeyToSheetName(key) {
+  const map = {
+    STORE_USERS_DB_V7_CLEAN: 'users',
+    STORE_REQUESTS_DB_V7_CLEAN: 'requests',
+    STORE_CHAT_DB_V7_CLEAN: 'chat',
+    STORE_CHAT_ROOM_DB_V7_CLEAN: 'chat_rooms',
+    STORE_TTD_DB_V7_CLEAN: 'ttd',
+    STORE_CUSTOM_TOKO_LIST_V7_CLEAN: 'stores',
+    STORE_DELETED_TOKO_LIST_V7_CLEAN: 'deleted_stores',
+    STORE_SYSTEM_NOTIFICATIONS_V7_CLEAN: 'notifications',
+    STORE_KODE_UNIT_MAP_V7_CLEAN: 'kode_unit_map',
+    STORE_FEATURE_PHOTOS_V7_CLEAN: 'feature_photos',
+    STORE_DELETED_REQUESTS_V7_CLEAN: 'deleted_requests',
+    STORE_DELETED_USERS_V7_CLEAN: 'deleted_users',
+    STORE_FONTE_TOKEN_KEY_V7_CLEAN: 'fonte_token',
+    STORE_ADMIN_REMINDER_KEY_V7_CLEAN: 'admin_reminder',
+    STORE_ADMIN_SECRET_KEY_V7_CLEAN: 'admin_secret',
+    STORE_ACTIVE_SESSION_V7_CLEAN: 'sessions',
+    STORE_ACTIVE_THEME_V7_CLEAN: 'theme',
+    STORE_ADMIN_SCRIPT_URL_V7_CLEAN: 'admin_script_url'
+  };
+  return map[String(key || '').trim().toUpperCase()] || 'app_storage';
+}
+
+function mapSheetNameToStorageKey(sheetName) {
+  const map = {
+    users: 'STORE_USERS_DB_V7_CLEAN',
+    requests: 'STORE_REQUESTS_DB_V7_CLEAN',
+    chat: 'STORE_CHAT_DB_V7_CLEAN',
+    chat_rooms: 'STORE_CHAT_ROOM_DB_V7_CLEAN',
+    ttd: 'STORE_TTD_DB_V7_CLEAN',
+    stores: 'STORE_CUSTOM_TOKO_LIST_V7_CLEAN',
+    deleted_stores: 'STORE_DELETED_TOKO_LIST_V7_CLEAN',
+    notifications: 'STORE_SYSTEM_NOTIFICATIONS_V7_CLEAN',
+    kode_unit_map: 'STORE_KODE_UNIT_MAP_V7_CLEAN',
+    feature_photos: 'STORE_FEATURE_PHOTOS_V7_CLEAN',
+    deleted_requests: 'STORE_DELETED_REQUESTS_V7_CLEAN',
+    deleted_users: 'STORE_DELETED_USERS_V7_CLEAN',
+    fonte_token: 'STORE_FONTE_TOKEN_KEY_V7_CLEAN',
+    admin_reminder: 'STORE_ADMIN_REMINDER_KEY_V7_CLEAN',
+    admin_secret: 'STORE_ADMIN_SECRET_KEY_V7_CLEAN',
+    sessions: 'STORE_ACTIVE_SESSION_V7_CLEAN',
+    theme: 'STORE_ACTIVE_THEME_V7_CLEAN',
+    admin_script_url: 'STORE_ADMIN_SCRIPT_URL_V7_CLEAN'
+  };
+  return map[String(sheetName || '').trim().toLowerCase()] || null;
+}
+
 async function loadAllFromSupabase() {
   const endpoint = getCloudEndpoint();
   if (!endpoint) return;
@@ -158,22 +248,39 @@ async function loadAllFromSupabase() {
       if (!resp.ok) throw new Error('Failed to fetch from Sheets endpoint');
       const payload = await resp.json();
       if (payload && Array.isArray(payload.data)) {
-        payload.data.forEach(row => {
-          if (row && row.key) memoryCache.set(row.key, serializeForCache(row.value));
+        payload.data.forEach(sheet => {
+          if (!sheet || !sheet.sheet) return;
+          const storageKey = mapSheetNameToStorageKey(sheet.sheet);
+          if (!storageKey) return;
+          const rows = Array.isArray(sheet.rows) ? sheet.rows : [];
+          const parsedRows = rows
+            .map(r => {
+              if (r && r.data_json !== undefined) {
+                const raw = r.data_json;
+                if (typeof raw === 'string') {
+                  try { return JSON.parse(raw); } catch { return raw; }
+                }
+                return raw;
+              }
+              return r;
+            })
+            .filter(item => item !== null && item !== undefined && item !== '');
+
+          if (parsedRows.length) {
+            memoryCache.set(storageKey, serializeForCache(parsedRows));
+          }
         });
         if (typeof onDataChangeCallback === 'function') onDataChangeCallback(null);
       }
     } else if (endpoint && endpoint.type === 'sheets_api') {
-      // Read from Google Sheets API: expects a sheet named 'app_storage' with columns: key,value,updated_at
+      // Legacy fallback: read a simple sheet named app_storage
       const sheetRange = 'app_storage!A:C';
       const url = `https://sheets.googleapis.com/v4/spreadsheets/${endpoint.spreadsheetId}/values/${encodeURIComponent(sheetRange)}?key=${endpoint.apiKey}`;
       const resp = await fetch(url, { cache: 'no-store' });
       if (!resp.ok) throw new Error('Failed to fetch from Google Sheets API');
       const payload = await resp.json();
-      // payload.values is array of rows
       if (payload && Array.isArray(payload.values)) {
         payload.values.forEach(r => {
-          // expect [key, value, updated_at]
           const key = r[0];
           const val = r[1];
           if (key) memoryCache.set(key, serializeForCache(val));
@@ -188,7 +295,7 @@ async function loadAllFromSupabase() {
 }
 
 function schedulePersist(key, parsedValue) {
-  pendingWrites.set(key, parsedValue);
+  pendingWrites.set(key, normalizeDateFields(parsedValue));
   if (writeTimer) clearTimeout(writeTimer);
   writeTimer = setTimeout(flushPendingWrites, 300);
 }
@@ -205,10 +312,11 @@ async function flushPendingWrites() {
 
   const batch = [];
   for (const [k, v] of pendingWrites) {
+    const sheet = mapStorageKeyToSheetName(k);
     if (v && v.__DELETE__) {
-      batch.push({ key: k, op: 'delete' });
+      batch.push({ key: k, sheet, op: 'delete' });
     } else {
-      batch.push({ key: k, op: 'upsert', value: v });
+      batch.push({ key: k, sheet, op: 'upsert', value: v });
     }
   }
   pendingWrites.clear();

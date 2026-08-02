@@ -72,6 +72,30 @@ function getScriptProp(key) {
   return PropertiesService.getScriptProperties().getProperty(key) || null;
 }
 
+function inferSheetName(key) {
+  const map = {
+    STORE_USERS_DB_V7_CLEAN: 'users',
+    STORE_REQUESTS_DB_V7_CLEAN: 'requests',
+    STORE_CHAT_DB_V7_CLEAN: 'chat',
+    STORE_CHAT_ROOM_DB_V7_CLEAN: 'chat_rooms',
+    STORE_TTD_DB_V7_CLEAN: 'ttd',
+    STORE_CUSTOM_TOKO_LIST_V7_CLEAN: 'stores',
+    STORE_DELETED_TOKO_LIST_V7_CLEAN: 'deleted_stores',
+    STORE_SYSTEM_NOTIFICATIONS_V7_CLEAN: 'notifications',
+    STORE_KODE_UNIT_MAP_V7_CLEAN: 'kode_unit_map',
+    STORE_FEATURE_PHOTOS_V7_CLEAN: 'feature_photos',
+    STORE_DELETED_REQUESTS_V7_CLEAN: 'deleted_requests',
+    STORE_DELETED_USERS_V7_CLEAN: 'deleted_users',
+    STORE_FONTE_TOKEN_KEY_V7_CLEAN: 'fonte_token',
+    STORE_ADMIN_REMINDER_KEY_V7_CLEAN: 'admin_reminder',
+    STORE_ADMIN_SECRET_KEY_V7_CLEAN: 'admin_secret',
+    STORE_ACTIVE_SESSION_V7_CLEAN: 'sessions',
+    STORE_ACTIVE_THEME_V7_CLEAN: 'theme',
+    STORE_ADMIN_SCRIPT_URL_V7_CLEAN: 'admin_script_url'
+  };
+  return map[String(key || '').trim().toUpperCase()] || 'app_storage';
+}
+
 function loadAllSheets() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheets = ss.getSheets();
@@ -89,16 +113,18 @@ function loadSheetRows(sheetName) {
   const sh = ss.getSheetByName(sheetName);
   if (!sh) return [];
   const values = sh.getDataRange().getValues();
-  // Expect header or raw rows: attempt to map rows to {key,value,updated_at}
-  const out = [];
-  values.forEach((r, idx) => {
-    const key = (r[0] || '').toString();
-    const value = (r[1] !== undefined ? r[1] : '');
-    const updated_at = (r[2] !== undefined ? r[2] : '');
-    if (!key) return; // skip empty key rows
-    out.push({ key: key.toString(), value: value, updated_at: updated_at });
-  });
-  return out;
+  if (!values.length) return [];
+
+  const firstRow = values[0] || [];
+  const isHeaderRow = String(firstRow[0] || '').toLowerCase() === 'source_key';
+  const dataRows = isHeaderRow ? values.slice(1) : values;
+
+  return dataRows.map(row => ({
+    source_key: row[0] || '',
+    record_id: row[1] || '',
+    data_json: row[2] || '',
+    updated_at: row[3] || ''
+  })).filter(r => String(r.source_key || r.record_id || r.data_json || '').trim() !== '');
 }
 
 function writeBatch(entries) {
@@ -107,36 +133,41 @@ function writeBatch(entries) {
   const result = [];
   entries.forEach(ent => {
     try {
-      const sheetName = ent.sheet || 'app_storage';
+      const sheetName = ent.sheet || inferSheetName(ent.key);
       const sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
       const key = String(ent.key || '').trim();
       if (!key) { result.push({ key: null, ok: false, reason: 'missing_key' }); return; }
       const op = (ent.op || 'upsert').toString().toLowerCase();
+
+      if (sh.getLastRow() === 0) {
+        sh.appendRow(['source_key', 'record_id', 'data_json', 'updated_at']);
+      } else {
+        const firstRow = sh.getRange(1, 1, 1, 4).getValues()[0] || [];
+        if (!String(firstRow[0] || '').trim()) {
+          sh.getRange(1, 1, 1, 4).setValues([['source_key', 'record_id', 'data_json', 'updated_at']]);
+        }
+      }
+
       if (op === 'delete') {
-        // find row(s) with key in column A and delete
-        const range = sh.getRange(1,1,sh.getLastRow(),1);
-        const vals = range.getValues().map(r => String(r[0] || ''));
-        for (let i = vals.length -1; i >=0; i--) {
-          if (vals[i] === key) sh.deleteRow(i+1);
+        const lastRow = sh.getLastRow();
+        if (lastRow > 1) {
+          const dataRange = sh.getRange(2, 1, lastRow - 1, 1).getValues();
+          for (let i = dataRange.length - 1; i >= 0; i--) {
+            if (String(dataRange[i][0] || '') === key) sh.deleteRow(i + 2);
+          }
         }
         result.push({ key, ok: true, op: 'delete' });
       } else {
-        // upsert: find first row with key, update value & timestamp, else append
-        const lastRow = sh.getLastRow();
-        let foundRow = -1;
-        if (lastRow >= 1) {
-          const keys = sh.getRange(1,1,lastRow,1).getValues().map(r=>String(r[0]||''));
-          for (let i=0;i<keys.length;i++) {
-            if (keys[i] === key) { foundRow = i+1; break; }
-          }
-        }
         const now = ent.updated_at || new Date().toISOString();
-        if (foundRow !== -1) {
-          sh.getRange(foundRow,2).setValue(ent.value);
-          sh.getRange(foundRow,3).setValue(now);
-        } else {
-          sh.appendRow([key, ent.value, now]);
-        }
+        const values = Array.isArray(ent.value) ? ent.value : [ent.value];
+        values.forEach(item => {
+          if (item && typeof item === 'object' && !Array.isArray(item)) {
+            const recordId = String(item.id || item.noSurat || item.username || item.roomId || item.messageId || `${Date.now()}-${Math.random() * 1000}`);
+            sh.appendRow([key, recordId, JSON.stringify(item), now]);
+          } else {
+            sh.appendRow([key, '', JSON.stringify(item), now]);
+          }
+        });
         result.push({ key, ok: true, op: 'upsert' });
       }
     } catch (err) {

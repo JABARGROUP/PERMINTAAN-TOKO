@@ -21,7 +21,7 @@ const DELETED_USERS_KEY = 'STORE_DELETED_USERS_V7_CLEAN';
 const FONTE_TOKEN_KEY = 'STORE_FONTE_TOKEN_KEY_V7_CLEAN';
 const ADMIN_REMINDER_KEY = 'STORE_ADMIN_REMINDER_KEY_V7_CLEAN';
 const ADMIN_SECRET_KEY_STORAGE_KEY = 'STORE_ADMIN_SECRET_KEY_V7_CLEAN';
-const ADMIN_SCRIPT_URL_KEY = 'STORE_ADMIN_SCRIPT_URL_V7_CLEAN';
+const ADMIN_SCRIPT_URL_STORAGE_KEY = 'STORE_ADMIN_SCRIPT_URL_V7_CLEAN';
 
 if (!window.appStorage) {
   const fallbackMemory = {};
@@ -950,13 +950,13 @@ function clearAllAppCacheAndData(force = false) {
 }
 
 function getAdminScriptUrl() {
-  return (appStorage.getItem(ADMIN_SCRIPT_URL_KEY) || '').trim();
+  return (appStorage.getItem(ADMIN_SCRIPT_URL_STORAGE_KEY) || '').trim();
 }
 
 function saveAdminScriptUrl(url) {
   const clean = (url || '').trim();
-  if (clean) appStorage.setItem(ADMIN_SCRIPT_URL_KEY, clean);
-  else appStorage.removeItem(ADMIN_SCRIPT_URL_KEY);
+  if (clean) appStorage.setItem(ADMIN_SCRIPT_URL_STORAGE_KEY, clean);
+  else appStorage.removeItem(ADMIN_SCRIPT_URL_STORAGE_KEY);
 }
 
 function loadAdminScriptUrlInput() {

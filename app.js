@@ -1115,10 +1115,24 @@ function updateThemeIcon() {
 // AUTHENTICATION & SESSION
 function autoLogin() {
   const sess = appStorage.getItem(SESSION_KEY);
-  if (sess) {
-    currentUser = JSON.parse(sess);
+
+  if (!sess) {
+    currentUser = null;
+    pindahHalaman('loginPage');
+    return;
+  }
+
+  try {
+    const parsed = typeof sess === 'string' ? JSON.parse(sess) : sess;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('SESSION_INVALID');
+    }
+    currentUser = parsed;
     bukaMainApp();
-  } else {
+  } catch (err) {
+    console.warn('⚠️ Session Google Sheets tidak valid, session dibersihkan:', err.message);
+    currentUser = null;
+    try { appStorage.removeItem(SESSION_KEY); } catch (_) {}
     pindahHalaman('loginPage');
   }
 }

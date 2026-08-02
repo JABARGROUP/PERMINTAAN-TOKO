@@ -150,15 +150,58 @@ function ensureSheetHeader(sh) {
     return;
   }
 
-  const first = sh.getRange(1, 1, 1, 4).getValues()[0];
+  const first = sh.getRange(1, 1, 1, Math.min(4, sh.getLastColumn())).getValues()[0] || [];
   const valid = String(first[0] || '').trim() === 'source_key' &&
                 String(first[1] || '').trim() === 'record_id' &&
                 String(first[2] || '').trim() === 'data_json' &&
                 String(first[3] || '').trim() === 'updated_at';
 
   if (!valid) {
-    // Existing legacy data: preserve it by moving it into data_json rows.
     migrateLegacySheet(sh);
+  }
+}
+
+function repairCanonicalSheet(sh) {
+  ensureSheetHeader(sh);
+  if (sh.getLastRow() <= 1) return;
+
+  const values = sh.getRange(2, 1, sh.getLastRow() - 1, 4).getValues();
+  const keep = [];
+  const seen = new Set();
+
+  values.forEach(row => {
+    const sourceKey = String(row[0] || '').trim();
+    const recordId = String(row[1] || '').trim();
+    const dataJson = row[2];
+
+    if (!sourceKey && !recordId && !String(dataJson || '').trim()) return;
+
+    // Semua data_json yang dibuat aplikasi harus JSON valid.
+    // Baris seperti "data_json" adalah sisa header/korupsi lama dan dibuang.
+    let parsedOk = false;
+    try {
+      JSON.parse(String(dataJson));
+      parsedOk = true;
+    } catch (_) {}
+
+    if (!parsedOk) return;
+
+    const safeRecordId = recordId || ('hash-' + digestId(String(dataJson)));
+    const fp = rowFingerprint(sourceKey, safeRecordId);
+    if (seen.has(fp)) return;
+
+    seen.add(fp);
+    keep.push([
+      sourceKey,
+      safeRecordId,
+      String(dataJson),
+      row[3] || new Date().toISOString()
+    ]);
+  });
+
+  sh.getRange(2, 1, sh.getLastRow() - 1, 4).clearContent();
+  if (keep.length) {
+    sh.getRange(2, 1, keep.length, 4).setValues(keep);
   }
 }
 
@@ -170,22 +213,58 @@ function migrateLegacySheet(sh) {
     return;
   }
 
-  const old = values.slice(1);
+  const header = (values[0] || []).map(v => String(v || '').trim().toLowerCase());
+  const dataJsonCol = header.findIndex(v => v === 'data_json');
+
   const converted = [];
+  const old = values.slice(1);
+
   old.forEach((row, i) => {
-    const joined = row.map(v => v === null || v === undefined ? '' : String(v)).join(' | ').trim();
-    if (!joined) return;
-    converted.push(['legacy', 'legacy-' + (i + 1), JSON.stringify(row), new Date().toISOString()]);
+    // Legacy sheet yang sudah memiliki kolom data_json tetapi header lain
+    // tetap dipertahankan sebagai payload JSON asli.
+    if (dataJsonCol >= 0) {
+      const raw = row[dataJsonCol];
+      if (raw === null || raw === undefined || String(raw).trim() === '') return;
+
+      try {
+        const parsed = JSON.parse(String(raw));
+        const recordId = getRecordId(parsed);
+        converted.push([
+          String(row[0] || 'legacy').trim() || 'legacy',
+          recordId,
+          JSON.stringify(parsed),
+          row[3] || new Date().toISOString()
+        ]);
+        return;
+      } catch (_) {
+        // Jika bukan JSON valid, jangan masukkan data rusak ke database.
+        return;
+      }
+    }
+
+    const nonEmpty = row.some(v => v !== null && v !== undefined && String(v).trim() !== '');
+    if (!nonEmpty) return;
+
+    const payload = row.length === 1 ? row[0] : row;
+    const recordId = getRecordId(payload);
+    converted.push([
+      'legacy',
+      recordId,
+      JSON.stringify(payload),
+      new Date().toISOString()
+    ]);
   });
 
   sh.clear();
   sh.getRange(1, 1, 1, 4).setValues([HEADER]);
-  if (converted.length) sh.getRange(2, 1, converted.length, 4).setValues(converted);
+  if (converted.length) {
+    sh.getRange(2, 1, converted.length, 4).setValues(converted);
+  }
 }
 
 function cleanupDuplicateRowsOnce() {
   const props = PropertiesService.getScriptProperties();
-  if (props.getProperty('DEDUP_DONE_V2') === '1') return;
+  if (props.getProperty('DEDUP_DONE_V4') === '1') return;
 
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
@@ -194,12 +273,12 @@ function cleanupDuplicateRowsOnce() {
     Object.keys(SHEET_MAP).forEach(key => {
       const sh = ss.getSheetByName(SHEET_MAP[key]);
       if (sh) {
-        ensureSheetHeader(sh);
+        repairCanonicalSheet(sh);
         dedupeRowsInSheet(sh);
       }
     });
     SpreadsheetApp.flush();
-    props.setProperty('DEDUP_DONE_V2', '1');
+    props.setProperty('DEDUP_DONE_V4', '1');
   } finally {
     lock.releaseLock();
   }
@@ -207,39 +286,53 @@ function cleanupDuplicateRowsOnce() {
 
 function loadAllSheets() {
   const ss = getSpreadsheet();
-  return ss.getSheets().map(sh => ({
-    sheet: sh.getName(),
-    rows: loadSheetRows(sh.getName())
-  }));
+  return ss.getSheets()
+    .filter(sh => REVERSE_SHEET_MAP[sh.getName()])
+    .map(sh => ({
+      sheet: sh.getName(),
+      rows: loadSheetRows(sh.getName())
+    }));
 }
 
 function loadSheetRows(sheetName) {
   const ss = getSpreadsheet();
   const sh = ss.getSheetByName(sheetName);
-  if (!sh || sh.getLastRow() < 1) return [];
+  if (!sh) return [];
 
-  const values = sh.getDataRange().getValues();
-  if (!values.length) return [];
+  repairCanonicalSheet(sh);
 
-  const first = values[0] || [];
-  const isHeader = String(first[0] || '').trim() === 'source_key';
-  const rows = isHeader ? values.slice(1) : values;
+  if (sh.getLastRow() < 2) return [];
 
+  const values = sh.getRange(2, 1, sh.getLastRow() - 1, 4).getValues();
   const seen = new Set();
   const out = [];
-  rows.forEach(row => {
-    const item = {
-      source_key: row[0] || '',
-      record_id: row[1] || '',
-      data_json: row[2] || '',
-      updated_at: row[3] || ''
-    };
-    if (!String(item.source_key || item.record_id || item.data_json || '').trim()) return;
-    const fp = rowFingerprint(item.source_key, item.record_id || digestId(item.data_json));
+
+  values.forEach(row => {
+    const sourceKey = String(row[0] || '').trim();
+    const recordId = String(row[1] || '').trim();
+    const dataJson = String(row[2] || '');
+
+    if (!sourceKey && !recordId && !dataJson.trim()) return;
+
+    try {
+      JSON.parse(dataJson);
+    } catch (_) {
+      return;
+    }
+
+    const safeRecordId = recordId || ('hash-' + digestId(dataJson));
+    const fp = rowFingerprint(sourceKey, safeRecordId);
     if (seen.has(fp)) return;
+
     seen.add(fp);
-    out.push(item);
+    out.push({
+      source_key: sourceKey,
+      record_id: safeRecordId,
+      data_json: dataJson,
+      updated_at: row[3] || ''
+    });
   });
+
   return out;
 }
 
@@ -329,6 +422,7 @@ function writeBatch(entries) {
       const sheetName = String(ent.sheet || SHEET_MAP[key] || 'app_storage').trim();
       const sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
       ensureSheetHeader(sh);
+      repairCanonicalSheet(sh);
 
       const op = String(ent.op || 'upsert').toLowerCase().trim();
       const now = ent.updated_at || new Date().toISOString();
@@ -344,6 +438,7 @@ function writeBatch(entries) {
           });
           deleteRows.reverse().forEach(r => sh.deleteRow(r));
         }
+        repairCanonicalSheet(sh);
         results.push({ key, sheet: sheetName, op: 'delete', ok: true });
         return;
       }

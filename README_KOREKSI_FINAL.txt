@@ -1,38 +1,50 @@
-PERMINTAAN TOKO - GOOGLE SHEETS PROXY FINAL
+PERMINTAAN TOKO — GOOGLE SHEETS PROXY V2
 ============================================
-Tanggal: 02/08/2026
 
-ARSITEKTUR
-----------
-GitHub Pages -> Google Apps Script Web App (Proxy) -> Google Sheets
+PERBAIKAN V2
+------------
+1. Memperbaiki crash:
+   SyntaxError: Unexpected token 'd', "data_json" is not valid JSON
+   Session corrupt sekarang tidak menghentikan aplikasi.
+2. Apps Script sekarang memperbaiki/membersihkan row database yang data_json-nya tidak valid.
+   Row sisa header seperti "data_json" tidak lagi dimuat sebagai session/user/request.
+3. Migrasi legacy sheet lebih aman: kolom data_json lama dipertahankan sebagai payload JSON jika valid.
+4. WRITE + VERIFIKASI sekarang benar-benar membandingkan data yang dikirim dengan data yang kembali dari Google Sheets.
+   Jadi log "WRITE + VERIFIKASI GOOGLE SHEETS BERHASIL" tidak lagi muncul hanya karena GET berhasil.
+5. Edit/tambah menggunakan replace/upsert idempotent berdasarkan record_id.
+6. Hapus key menghapus semua row untuk storage key tersebut; penghapusan item individual dilakukan dengan replace array setelah item dikeluarkan.
+7. LockService tetap digunakan untuk mencegah write bersamaan membuat duplikat.
+8. Endpoint tetap deployment yang diberikan:
+   https://script.google.com/macros/s/AKfycbwGhyK4a4CRlgskSyEsNrafRzfM8aj_K2df5uvT0k-5wWXoz_lK3Daah9ZIt_rtXj8umA/exec
 
-Google Sheets menjadi database utama. Browser hanya menyimpan data aplikasi di memory selama halaman aktif;
-tidak menggunakan localStorage/sessionStorage sebagai database.
+WAJIB
+-----
+A. Ganti Code.gs pada project Google Apps Script dengan Code.gs dari ZIP ini.
+B. Deploy versi baru pada Web App yang sama.
+   Execute as: Me
+   Who has access: Anyone
+C. Jangan mengubah POST frontend menjadi application/json.
+D. Upload seluruh file frontend ke GitHub Pages.
+E. Lakukan Ctrl+F5 / hard refresh.
 
-PERBAIKAN UTAMA
----------------
-1. CORS:
-   - GET menggunakan JSONP.
-   - POST menggunakan text/plain + no-cors sehingga tidak memicu OPTIONS preflight.
-   - Setelah POST, frontend membaca ulang data melalui JSONP untuk verifikasi.
-2. Tidak ada lagi addHeader() pada ContentService Apps Script.
-3. Tidak ada lagi duplicate let/const/function di supabase-db.js.
-4. Firebase/Firestore legacy di app.js dibersihkan dari mesin database utama.
-5. Urutan startup diperbaiki: config -> load Sheet -> seed key yang benar-benar belum ada.
-6. Semua perubahan data memakai replace/upsert yang idempotent.
-7. Apps Script menggunakan LockService untuk mencegah dua write bersamaan merusak data.
-8. record_id dibuat stabil dari id/noSurat/username/messageId/dll atau hash data.
-9. Duplicate record dalam sheet dibersihkan satu kali saat load pertama versi ini.
-10. Delete/edit/add bekerja melalui Google Sheets.
-11. Nomor surat tidak lagi memakai requests.length + 1; generator mencari nomor terakhir agar tidak bentrok setelah data dihapus.
-12. Polling tidak menarik data dari server saat ada write yang masih antre.
+PENTING UNTUK DATA LAMA
+-----------------------
+Versi V2 otomatis memperbaiki sheet database yang dikenal saat load.
+Jika ada data lama yang rusak (misalnya row hanya berisi "data_json"), row rusak tersebut akan dibuang.
+Data valid tetap dipertahankan.
 
-STRUKTUR SHEET
+STRUKTUR
+--------
+GitHub Pages
+  -> JSONP GET / text/plain POST
+  -> Google Apps Script Web App
+  -> Google Sheets
+
+Google Sheets adalah database utama.
+Browser hanya memory cache selama halaman aktif.
+
+SHEET DATABASE
 --------------
-Setiap sheet database memakai 4 kolom:
-source_key | record_id | data_json | updated_at
-
-Sheet aplikasi yang dipakai:
 users
 requests
 chat
@@ -52,38 +64,22 @@ sessions
 theme
 admin_script_url
 
-WAJIB SETELAH UPLOAD Code.gs
-------------------------------
-1. Buka project Google Apps Script yang menjadi proxy.
-2. Ganti seluruh isi Code.gs dengan Code.gs dari paket ini.
-3. Deploy -> Manage deployments.
-4. Edit deployment Web app / buat deployment baru.
-5. Execute as: Me.
-6. Who has access: Anyone.
-7. URL deployment yang dipakai paket ini sudah diset ke deployment /exec yang diberikan pengguna.
-8. Jika nanti deployment dibuat ulang dan URL berubah, ganti SHEETS_ENDPOINT di sheets-config.json.
-9. Reload GitHub Pages dengan hard refresh (Ctrl+F5).
+FORMAT
+------
+source_key | record_id | data_json | updated_at
 
-SPREADSHEET
------------
-Code.gs sudah memiliki DEFAULT_SPREADSHEET_ID yang sama dengan sheets-config.json.
-Tetap disarankan mengatur Script Property:
-SPREADSHEET_ID = ID spreadsheet tujuan.
+SETELAH DEPLOY
+--------------
+1. Buka GitHub Pages.
+2. Ctrl+F5.
+3. Login.
+4. Buka Console.
+5. Saat tambah/edit/hapus, log yang benar harus:
+   Mengirim batch ke Google Sheets: N
+   WRITE + VERIFIKASI GOOGLE SHEETS BERHASIL
 
-PEMBERSIHAN DUPLIKAT
---------------------
-Versi ini melakukan cleanup duplikat satu kali menggunakan Script Property DEDUP_DONE_V2.
-Setelah itu semua write baru dibuat idempotent berdasarkan record_id.
-Jika ingin menjalankan cleanup ulang setelah mengganti database:
-- hapus Script Property DEDUP_DONE_V2 dari project Apps Script,
-- lalu reload aplikasi.
+Jika muncul:
+   WRITE TIDAK TERVERIFIKASI: ...
+maka data benar-benar belum dianggap tersimpan dan frontend akan retry.
 
-CATATAN
--------
-POST memakai no-cors sehingga browser memang tidak membaca response POST secara langsung.
-Itu disengaja. Keberhasilan write diverifikasi dengan GET/JSONP sesudah POST.
-Jangan mengganti POST menjadi application/json karena akan menghidupkan CORS preflight lagi.
-
-ENDPOINT DEPLOYMENT SAAT INI
----------------------------
-https://script.google.com/macros/s/AKfycbwGhyK4a4CRlgskSyEsNrafRzfM8aj_K2df5uvT0k-5wWXoz_lK3Daah9ZIt_rtXj8umA/exec
+Jika endpoint Apps Script masih menjalankan Code.gs lama, V2 tidak dapat memperbaiki server sampai deployment dibuat ke versi Code.gs baru.

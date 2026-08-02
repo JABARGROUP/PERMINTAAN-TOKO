@@ -308,6 +308,54 @@ async function postNoCors(payload) {
   });
 }
 
+
+function stableCloudValue(value) {
+  if (value === undefined) return '__UNDEFINED__';
+  if (value === null) return null;
+  if (typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(stableCloudValue);
+  const out = {};
+  Object.keys(value).sort().forEach(k => { out[k] = stableCloudValue(value[k]); });
+  return out;
+}
+
+function sameCloudValue(a, b) {
+  try {
+    return JSON.stringify(stableCloudValue(a)) === JSON.stringify(stableCloudValue(b));
+  } catch (_) {
+    return String(a) === String(b);
+  }
+}
+
+function verifyWriteSnapshot(snapshot) {
+  const failures = [];
+
+  (snapshot || []).forEach(entry => {
+    const key = String(entry && entry.key || '').trim();
+    if (!key) return;
+
+    const actualRaw = appStorage.getItem(key);
+    const actual = actualRaw === null ? null : parseStorageValue(actualRaw);
+
+    if (String(entry.op || '').toLowerCase() === 'delete') {
+      if (actualRaw !== null) failures.push(key + ':delete');
+      return;
+    }
+
+    const expected = SCALAR_KEYS.has(key)
+      ? entry.value
+      : (Array.isArray(entry.value) ? entry.value : [entry.value]);
+
+    if (!sameCloudValue(actual, expected)) {
+      failures.push(key + ':verify');
+    }
+  });
+
+  if (failures.length) {
+    throw new Error('WRITE TIDAK TERVERIFIKASI: ' + failures.join(', '));
+  }
+}
+
 async function flushPendingWrites() {
   if (!isSupabaseReady || cloudSyncBusy || pendingWrites.size === 0) return false;
 
@@ -319,9 +367,12 @@ async function flushPendingWrites() {
     console.log('📤 Mengirim batch ke Google Sheets:', snapshot.length);
     await postNoCors({ action: 'write', data: snapshot });
 
-    // Beri Apps Script sedikit waktu untuk flush ke spreadsheet sebelum verifikasi.
-    await new Promise(resolve => setTimeout(resolve, 700));
+    // Apps Script dapat membutuhkan sedikit waktu untuk commit.
+    await new Promise(resolve => setTimeout(resolve, 900));
     await loadAllFromSupabase();
+
+    // GET berhasil saja belum membuktikan data benar-benar tersimpan.
+    verifyWriteSnapshot(snapshot);
 
     isSupabaseOnline = true;
     updateSupabaseStatusUI(true);

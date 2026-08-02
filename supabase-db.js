@@ -1,87 +1,57 @@
 /* ======================================================
-   GOOGLE SHEETS (APPS SCRIPT) DATABASE ADAPTER
-   Replaces Supabase client with a simple Apps Script HTTP endpoint
-   Expected endpoint: deploy a Google Apps Script Web App that accepts
-   GET ?action=loadAll and POST with { action: 'write', data: [...] }
+   GOOGLE SHEETS (APPS SCRIPT) DATABASE ADAPTER - CLOUD ONLY
+   - Semua data LANGSUNG dari Google Sheets
+   - TANPA cache lokal (no localStorage, no sessionStorage)
+   - TANPA foto (disable upload image)
 ====================================================== */
 
 const memoryCache = new Map();
-// When true, do not persist any cache to sessionStorage/localStorage
-const DISABLE_PERSISTENCE = true;
+// DISABLE semua penyimpanan lokal
+const DISABLE_PERSISTENCE = true; // retained for backward compatibility; storage is memory-only
 const sessionKey = window.SESSION_KEY || 'STORE_ACTIVE_SESSION_V7_CLEAN';
 const themeKey = window.THEME_KEY || 'STORE_ACTIVE_THEME_V7_CLEAN';
 const ADMIN_SCRIPT_URL_STORAGE_KEY = window.ADMIN_SCRIPT_URL_KEY || 'STORE_ADMIN_SCRIPT_URL_V7_CLEAN';
 
 let pendingWrites = new Map();
 let writeTimer = null;
-let isSupabaseReady = false; // kept for compatibility with app.js
+let isSupabaseReady = false;
 let isSupabaseOnline = false;
 let onDataChangeCallback = null;
-// Timestamp of last successful push; used to suppress immediate pulls
 let lastPushAt = 0;
-const PUSH_SUPPRESS_MS = 3000; // suppress pulls for 3 seconds after push
+const PUSH_SUPPRESS_MS = 2000;
 
 const appStorage = {
   getItem(key) {
-    try {
-      if (!DISABLE_PERSISTENCE) {
-        const storedValue = window.sessionStorage ? window.sessionStorage.getItem(key) : null;
-        if (storedValue !== null) {
-          memoryCache.set(key, storedValue);
-          return storedValue;
-        }
-      }
-    } catch (err) {
-      // fallback to memory cache
-    }
-
     if (!memoryCache.has(key)) return null;
     const val = memoryCache.get(key);
     return typeof val === 'string' ? val : JSON.stringify(val);
   },
 
   setItem(key, value) {
+    const previousCachedStr = memoryCache.get(key);
+    const previousCachedValue = previousCachedStr !== undefined
+      ? parseStorageValue(previousCachedStr)
+      : undefined;
     const normalizedValue = normalizeDateFields(value);
-    const strVal = typeof normalizedValue === 'string' ? normalizedValue : JSON.stringify(normalizedValue);
+    const strVal = typeof normalizedValue === 'string'
+      ? normalizedValue
+      : JSON.stringify(normalizedValue);
+
     memoryCache.set(key, strVal);
-    try {
-      // Persist session to sessionStorage only if persistence enabled
-      if (!DISABLE_PERSISTENCE && window.sessionStorage && key === sessionKey) {
-        window.sessionStorage.setItem(key, strVal);
-      }
-    } catch (err) {
-      console.warn('storage write failed:', err.message);
-    }
-    schedulePersist(key, parseStorageValue(strVal));
+    schedulePersist(key, parseStorageValue(strVal), previousCachedValue);
   },
 
   removeItem(key) {
     memoryCache.delete(key);
-    try {
-      if (!DISABLE_PERSISTENCE && window.sessionStorage && key === sessionKey) {
-        window.sessionStorage.removeItem(key);
-      }
-    } catch (err) {
-      console.warn('localStorage remove failed:', err.message);
-    }
     scheduleDelete(key);
   },
 
   clear() {
-    // Keep only session in localStorage
-    const keepKeys = new Set([sessionKey]);
-    [...memoryCache.keys()].forEach(k => {
-      if (!keepKeys.has(k)) memoryCache.delete(k);
-    });
-
-    try {
-      if (!DISABLE_PERSISTENCE && window.sessionStorage) {
-        Object.keys(window.sessionStorage).forEach(k => {
-          if (!keepKeys.has(k)) window.sessionStorage.removeItem(k);
-        });
-      }
-    } catch (err) {
-      console.warn('localStorage clear failed:', err.message);
+    memoryCache.clear();
+    pendingWrites.clear();
+    if (writeTimer) {
+      clearTimeout(writeTimer);
+      writeTimer = null;
     }
   }
 };
@@ -153,6 +123,27 @@ function serializeForCache(value) {
   return JSON.stringify(normalizeDateFields(value));
 }
 
+function getRecordIdentity(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+
+  const candidateKeys = ['id', 'noSurat', 'username', 'roomId', 'messageId', 'key', 'code'];
+  for (const key of candidateKeys) {
+    const value = item[key];
+    if (value !== undefined && value !== null && value !== '') {
+      return String(value);
+    }
+  }
+
+  return null;
+}
+
+function getItemFingerprint(item) {
+  const identity = getRecordIdentity(item);
+  if (identity) return `id:${identity}`;
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+  try { return JSON.stringify(item); } catch { return null; }
+}
+
 function setOnDataChangeCallback(fn) { onDataChangeCallback = fn; }
 
 async function loadSupabaseConfigFromJson() {
@@ -178,12 +169,10 @@ async function loadSupabaseConfigFromJson() {
 }
 
 function getCloudEndpoint() {
-  // Priority: explicit Apps Script endpoint -> built Sheets API (spreadsheetId + apiKey) -> stored admin script URL
-  if (window.APP_SHEETS_ENDPOINT) return window.APP_SHEETS_ENDPOINT;
-  if (window.APP_SHEETS_SPREADSHEET_ID && window.APP_SHEETS_API_KEY) {
-    return { type: 'sheets_api', spreadsheetId: window.APP_SHEETS_SPREADSHEET_ID, apiKey: window.APP_SHEETS_API_KEY };
-  }
-  const stored = (appStorage.getItem(ADMIN_SCRIPT_URL_STORAGE_KEY) || '').trim();
+  const endpoint = String(window.APP_SHEETS_ENDPOINT || '').trim();
+  if (endpoint) return endpoint;
+
+  const stored = String(appStorage.getItem(ADMIN_SCRIPT_URL_STORAGE_KEY) || '').trim();
   return stored || null;
 }
 
@@ -314,105 +303,79 @@ async function loadAllFromSupabase() {
         onDataChangeCallback(null);
 
 }
-function schedulePersist(key, parsedValue) {
+function schedulePersist(key, parsedValue, previousCachedValue) {
   const normalized = normalizeDateFields(parsedValue);
-
-  // Helper to update memoryCache stored string
-  function setCache(k, v) {
-    memoryCache.set(k, serializeForCache(v));
-  }
+  const previous = previousCachedValue === undefined
+    ? undefined
+    : normalizeDateFields(previousCachedValue);
 
   try {
-    // If value is an array, try to append only new rows instead of replacing
+    if (JSON.stringify(previous) === JSON.stringify(normalized)) {
+      return;
+    }
+
     if (Array.isArray(normalized)) {
-      const cachedStr = memoryCache.get(key);
-      const cached = cachedStr ? parseStorageValue(cachedStr) : [];
-
-      if (!Array.isArray(cached) || cached.length === 0) {
-        if (!normalized || normalized.length === 0) return; // nothing to do
-        // No cache — set full array and append all rows
-        setCache(key, normalized);
-        pendingWrites.set(key, { __OP__: 'append', items: normalized });
+      if (!Array.isArray(previous)) {
+        pendingWrites.set(key, { __OP__: 'replace', items: normalized });
       } else {
-        // Try object-based diff (by `id` field)
-        const first = normalized[0];
-        const isObjects = typeof first === 'object' && first !== null;
-        if (isObjects) {
-          const cachedMap = new Map();
-          cached.forEach(it => { if (it && (it.id || it.id === 0)) cachedMap.set(String(it.id), it); });
+        const previousMap = new Map();
+        previous.forEach(item => {
+          const fingerprint = getItemFingerprint(item);
+          if (fingerprint) previousMap.set(fingerprint, item);
+        });
 
-          const newItems = [];
-          const updatedItems = [];
+        const nextMap = new Map();
+        const newItems = [];
+        const updatedItems = [];
 
-          normalized.forEach(it => {
-            const id = it && (it.id || it.id === 0) ? String(it.id) : null;
-            if (!id) return;
-            const existing = cachedMap.get(id);
-            if (!existing) newItems.push(it);
-            else if (JSON.stringify(existing) !== JSON.stringify(it)) updatedItems.push(it);
+        normalized.forEach(item => {
+          const fingerprint = getItemFingerprint(item);
+          if (!fingerprint) return;
+          nextMap.set(fingerprint, item);
+
+          const existing = previousMap.get(fingerprint);
+          if (!existing) {
+            newItems.push(item);
+          } else if (JSON.stringify(existing) !== JSON.stringify(item)) {
+            updatedItems.push(item);
+          }
+        });
+
+        const removedItems = [];
+        previousMap.forEach((item, fingerprint) => {
+          if (!nextMap.has(fingerprint)) removedItems.push(item);
+        });
+
+        if (removedItems.length > 0) {
+          pendingWrites.set(key, { __OP__: 'replace', items: normalized });
+        } else if (newItems.length && updatedItems.length) {
+          pendingWrites.set(key, {
+            __OPS__: [
+              { op: 'append', items: newItems },
+              { op: 'upsert', items: updatedItems }
+            ]
           });
-
-          if (newItems.length === 0 && updatedItems.length === 0) {
-            return; // no changes
-          }
-
-          // merge into cached representation
-          const merged = [...cached];
-          const idxById = new Map();
-          merged.forEach((it, idx) => { if (it && (it.id || it.id === 0)) idxById.set(String(it.id), idx); });
-          newItems.forEach(it => merged.push(it));
-          updatedItems.forEach(it => {
-            const id = String(it.id);
-            if (idxById.has(id)) merged[idxById.get(id)] = it;
-            else merged.push(it);
-          });
-
-          setCache(key, merged);
-
-          // schedule append and/or upsert
-          if (newItems.length && updatedItems.length) {
-            pendingWrites.set(key, { __OPS__: [ { op: 'append', items: newItems }, { op: 'upsert', items: updatedItems } ] });
-          } else if (newItems.length) {
-            pendingWrites.set(key, { __OP__: 'append', items: newItems });
-          } else {
-            pendingWrites.set(key, { __OP__: 'upsert', items: updatedItems });
-          }
-        } else {
-          // primitive arrays: append tail if length increased
-          if (normalized.length > cached.length) {
-            const tail = normalized.slice(cached.length);
-            setCache(key, [...cached, ...tail]);
-            pendingWrites.set(key, { __OP__: 'append', items: tail });
-          } else if (JSON.stringify(normalized) !== JSON.stringify(cached)) {
-            // fallback: replace whole array
-            setCache(key, normalized);
-            pendingWrites.set(key, normalized);
-          } else {
-            return; // identical
-          }
+        } else if (newItems.length) {
+          pendingWrites.set(key, { __OP__: 'append', items: newItems });
+        } else if (updatedItems.length) {
+          pendingWrites.set(key, { __OP__: 'upsert', items: updatedItems });
         }
       }
     } else {
-      // Non-array values: write only if changed
-      const cachedStr = memoryCache.get(key);
-      const cached = cachedStr ? parseStorageValue(cachedStr) : cachedStr;
-      if (JSON.stringify(cached) === JSON.stringify(normalized)) return;
-      setCache(key, normalized);
       pendingWrites.set(key, normalized);
     }
   } catch (err) {
-    // On error fall back to simple persist
+    console.warn('schedulePersist failed:', err);
     pendingWrites.set(key, normalized);
   }
 
   if (writeTimer) clearTimeout(writeTimer);
-  writeTimer = setTimeout(flushPendingWrites, 300);
+  writeTimer = setTimeout(flushPendingWrites, 100);
 }
-
 function scheduleDelete(key) {
   pendingWrites.set(key, { __DELETE__: true });
   if (writeTimer) clearTimeout(writeTimer);
-  writeTimer = setTimeout(flushPendingWrites, 300);
+  writeTimer = setTimeout(flushPendingWrites, 100);
 }
 
 async function flushPendingWrites() {
@@ -455,7 +418,7 @@ async function flushPendingWrites() {
       batch.push({ key, sheet, op: 'upsert', value });
     }
 
-    pendingWrites.clear();
+    const pendingSnapshot = Array.from(pendingWrites.entries());
 
     try {
 
@@ -467,7 +430,7 @@ async function flushPendingWrites() {
         const resp = await fetch(proxyUrl, {
             method: "POST",
             headers: {
-                "Content-Type": "application/json"
+                "Content-Type": "text/plain;charset=utf-8"
             },
             body: JSON.stringify({
                 action: "write",
@@ -489,15 +452,21 @@ async function flushPendingWrites() {
             throw new Error(result.error);
         }
 
-          isSupabaseOnline = true;
-          updateSupabaseStatusUI(true);
-          // record last successful push time to avoid immediate pull overwrite
-          try { lastPushAt = Date.now(); } catch (e) {}
+        pendingSnapshot.forEach(([key, value]) => {
+          if (pendingWrites.get(key) === value) {
+            pendingWrites.delete(key);
+          }
+        });
+        isSupabaseOnline = true;
+        updateSupabaseStatusUI(true);
+        try { lastPushAt = Date.now(); } catch (e) {}
 
     } catch (err) {
 
         console.error("flushPendingWrites:", err);
-
+        pendingWrites = new Map(pendingSnapshot);
+        if (writeTimer) clearTimeout(writeTimer);
+        writeTimer = setTimeout(flushPendingWrites, 200);
         isSupabaseOnline = false;
         updateSupabaseStatusUI(false);
 
@@ -569,7 +538,7 @@ async function uploadPhotoToSupabaseStorage(file, fileName) {
         const resp = await fetch(endpoint.replace(/\/$/, ""), {
             method: "POST",
             headers: {
-                "Content-Type": "application/json"
+                "Content-Type": "text/plain;charset=utf-8"
             },
             body: JSON.stringify({
                 action: "uploadImage",

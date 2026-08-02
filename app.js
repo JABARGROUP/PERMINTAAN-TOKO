@@ -1,6 +1,6 @@
 /* ======================================================
    PERMINTAAN BARANG TOKO
-   MASTER APPLICATION LOGIC & SUPABASE DATABASE ENGINE
+   MASTER APPLICATION LOGIC & GOOGLE SHEETS DATABASE ENGINE
 ====================================================== */
 
 // STORAGE KEYS (V7_HARD_RESET_CLEAN)
@@ -432,13 +432,17 @@ function formatDateDDMMYYYYString(input) {
 // APP INITIALIZATION
 // APP INITIALIZATION
 document.addEventListener('DOMContentLoaded', async () => {
-  initDatabase();
+  // Load the endpoint first; otherwise the initial seed writes can be lost.
   if (typeof loadSupabaseConfigFromJson === 'function') {
-    // load config but don't block the UI
-    loadSupabaseConfigFromJson().catch(() => {});
+    await loadSupabaseConfigFromJson().catch(() => {});
   }
-  // Initialize cloud in background to avoid blocking UI responsiveness
-  initSupabaseDB().catch(() => {});
+
+  // Hydrate memory from Google Sheets before creating local defaults.
+  if (typeof initSupabaseDB === 'function') {
+    await initSupabaseDB().catch(() => {});
+  }
+
+  initDatabase();
   startCentralCloudSyncEngine();
   startSupabaseKeepalive();
   loadSavedTheme();
@@ -624,7 +628,7 @@ function checkAndTriggerPendingReminders() {
 }
 
 /* ======================================================
-   SUPABASE CLOUD SYNC (MENGGANTIKAN CLOUDFLARE / FIREBASE)
+   GOOGLE SHEETS CLOUD SYNC VIA APPS SCRIPT
    ====================================================== */
 let cloudSyncInterval = null;
 
@@ -707,6 +711,7 @@ function getFeaturePhotosEnabled() {
 
 function setFeaturePhotosEnabled(enabled) {
   appStorage.setItem(FEATURE_PHOTOS_KEY, enabled ? 'true' : 'false');
+  triggerCloudSyncForKey(FEATURE_PHOTOS_KEY, enabled ? 'true' : 'false');
   updatePhotoSectionVisibility();
   pushCentralCloudDB();
 }
@@ -719,134 +724,14 @@ function toggleFeaturePhotoAdmin() {
 }
 
 function updatePhotoSectionVisibility() {
+  // FOTO DI-DISABLE - Semua section upload foto disembunyikan
   const section = document.getElementById('sectionUploadFoto');
-  const isEnabled = getFeaturePhotosEnabled();
-
-  if (section) {
-    section.style.display = isEnabled ? 'block' : 'none';
-  }
-
+  if (section) section.style.display = 'none';
+  
   const statusText = document.getElementById('photoFeatureStatusText');
   if (statusText) {
-    statusText.textContent = isEnabled ? 'AKTIF (ON)' : 'NONAKTIF (OFF)';
-    statusText.style.color = isEnabled ? '#10b981' : '#ef4444';
-  }
-}
-
-/* ======================================================
-   FIREBASE CLOUD FIRESTORE & STORAGE REALTIME DATABASE ENGINE
-   ====================================================== */
-let dbCloud = null;
-let storageCloud = null;
-let isCloudDBActive = false;
-
-// Firebase Cloud Firestore Web Configuration
-const FIREBASE_CONFIG_STORAGE_KEY = 'FIREBASE_CUSTOM_CONFIG_V1';
-
-function getFirebaseConfig() {
-  const customConfigStr = appStorage.getItem(FIREBASE_CONFIG_STORAGE_KEY);
-  if (customConfigStr) {
-    try {
-      const parsed = JSON.parse(customConfigStr);
-      if (parsed && parsed.projectId) return parsed;
-    } catch(e) {}
-  }
-  return {
-    apiKey: "AIzaSyB-DEFAULT_PLACEHOLDER_KEY",
-    authDomain: "permintaantoko.firebaseapp.com",
-    projectId: "permintaantoko",
-    storageBucket: "permintaantoko.firebasestorage.app",
-    messagingSenderId: "123456789012",
-    appId: "1:123456789012:web:abc123def456"
-  };
-}
-
-const firebaseConfig = getFirebaseConfig();
-
-function initFirebaseCloudDB() {
-  if (typeof firebase !== 'undefined' && firebase.initializeApp) {
-    try {
-      if (!firebase.apps.length) {
-        firebase.initializeApp(firebaseConfig);
-      }
-      dbCloud = firebase.firestore();
-      try { storageCloud = firebase.storage(); } catch (sErr) {}
-      isCloudDBActive = true;
-      console.log('✅ FIREBASE CLOUD FIRESTORE & STORAGE TERHUBUNG BERHASIL!');
-      setupFirestoreRealtimeListeners();
-    } catch (err) {
-      console.warn('⚠️ FIREBASE FIRESTORE OFFLINE FALLBACK (LOCALSTORAGE MODE):', err.message);
-    }
-  }
-}
-
-async function uploadFotoToFirebaseStorage(file, fileName) {
-  if (storageCloud && isCloudDBActive) {
-    try {
-      const ref = storageCloud.ref('photos/' + (fileName || ('FOTO_' + Date.now() + '.jpg')));
-      const snapshot = await ref.put(file);
-      const downloadUrl = await snapshot.ref.getDownloadURL();
-      return downloadUrl;
-    } catch (e) {
-      console.warn('Firebase Storage error, falling back:', e);
-    }
-  }
-  return null;
-}
-
-function setupFirestoreRealtimeListeners() {
-  if (!dbCloud || !isCloudDBActive) return;
-
-  // Realtime Sync for Requests Collection
-  dbCloud.collection('requests').onSnapshot((snapshot) => {
-    if (snapshot && !snapshot.empty) {
-      const cloudRequests = [];
-      snapshot.forEach(doc => {
-        cloudRequests.push(doc.data());
-      });
-      if (cloudRequests.length > 0) {
-        appStorage.setItem(REQUESTS_DB_KEY, JSON.stringify(cloudRequests));
-        if (currentUser) {
-          loadDashboard();
-          loadRiwayat();
-          if (document.getElementById('masterDbTableBody')) loadMasterDbTable();
-        }
-      }
-    }
-  }, (err) => console.warn('Firestore Sync:', err.message));
-
-  // Realtime Sync for Users Collection
-  dbCloud.collection('users').onSnapshot((snapshot) => {
-    if (snapshot && !snapshot.empty) {
-      const cloudUsers = [];
-      snapshot.forEach(doc => {
-        cloudUsers.push(doc.data());
-      });
-      if (cloudUsers.length > 0) {
-        appStorage.setItem(USERS_DB_KEY, JSON.stringify(cloudUsers));
-        if (currentUser && document.getElementById('userTableBody')) {
-          loadUsersManagement();
-        }
-      }
-    }
-  }, (err) => console.warn('Firestore Users Sync:', err.message));
-}
-
-function syncRequestToCloud(reqObj) {
-  if (!dbCloud || !isCloudDBActive || !reqObj || !reqObj.noSurat) return;
-  try {
-    dbCloud.collection('requests').doc(reqObj.noSurat).set(reqObj, { merge: true });
-  } catch (e) {
-    console.warn('Cloud Request Sync Error:', e);
-  }
-}
-
-function syncUserToCloud(userObj) {
-  if (!dbCloud || !isCloudDBActive || !userObj || !userObj.id) return;
-  try {
-    dbCloud.collection('users').doc(userObj.id).set(userObj, { merge: true });
-  } catch (e) {
-    console.warn('Cloud User Sync Error:', e);
+    statusText.textContent = 'NONAKTIF (DISABLED)';
+    statusText.style.color = '#ef4444';
   }
 }
 
@@ -894,49 +779,12 @@ function clearAllAppCacheAndData(force = false) {
   }
 
   try {
-    const keysToRemove = Object.keys(localStorage || {});
-    keysToRemove.forEach(key => {
-      if (String(key).startsWith('STORE_') || String(key).startsWith('FIREBASE_')) {
-        localStorage.removeItem(key);
-      }
-    });
-  } catch (err) {
-    console.warn('clearAllAppCacheAndData localStorage failed:', err);
-  }
-
-  try {
-    if (typeof caches !== 'undefined' && Array.isArray(caches)) {
+    if (typeof caches !== 'undefined' && typeof caches.keys === 'function') {
       caches.keys().then(names => names.forEach(n => caches.delete(n))).catch(() => {});
     }
   } catch (err) {
     console.warn('clearAllAppCacheAndData caches failed:', err);
   }
-
-  const sessionKeys = [
-    SESSION_KEY,
-    THEME_KEY,
-    USERS_DB_KEY,
-    REQUESTS_DB_KEY,
-    CHAT_DB_KEY,
-    CHAT_ROOM_DB_KEY,
-    TTD_DB_KEY,
-    STORES_DB_KEY,
-    DELETED_STORES_KEY,
-    NOTIFICATIONS_DB_KEY,
-    KODE_UNIT_MAP_KEY,
-    FEATURE_PHOTOS_KEY,
-    DELETED_REQUESTS_KEY,
-    DELETED_USERS_KEY,
-    FONTE_TOKEN_KEY,
-    ADMIN_REMINDER_KEY,
-    ADMIN_SECRET_KEY_STORAGE_KEY,
-    ADMIN_SCRIPT_URL_STORAGE_KEY
-  ];
-
-  sessionKeys.forEach(key => {
-    try { localStorage.removeItem(key); } catch (err) {}
-    try { window.appStorage?.removeItem?.(key); } catch (err) {}
-  });
 
   if (window.appStorage) {
     window.appStorage.setItem(USERS_DB_KEY, JSON.stringify([...SEED_USERS]));
@@ -958,8 +806,13 @@ function getAdminScriptUrl() {
 
 function saveAdminScriptUrl(url) {
   const clean = (url || '').trim();
-  if (clean) appStorage.setItem(ADMIN_SCRIPT_URL_STORAGE_KEY, clean);
-  else appStorage.removeItem(ADMIN_SCRIPT_URL_STORAGE_KEY);
+  if (clean) {
+    appStorage.setItem(ADMIN_SCRIPT_URL_STORAGE_KEY, clean);
+    syncDataToCloud(ADMIN_SCRIPT_URL_STORAGE_KEY, clean);
+  } else {
+    appStorage.removeItem(ADMIN_SCRIPT_URL_STORAGE_KEY);
+    syncDataToCloud(ADMIN_SCRIPT_URL_STORAGE_KEY, '');
+  }
 }
 
 function loadAdminScriptUrlInput() {
@@ -987,7 +840,8 @@ function initDatabase() {
     [KODE_UNIT_MAP_KEY]: JSON.stringify({}),
     [FEATURE_PHOTOS_KEY]: 'true',
     [NOTIFICATIONS_DB_KEY]: JSON.stringify([]),
-    [DELETED_USERS_KEY]: JSON.stringify([])
+    [DELETED_USERS_KEY]: JSON.stringify([]),
+    [STORES_DB_KEY]: JSON.stringify([])
   };
 
   Object.entries(safeDefaults).forEach(([key, value]) => {
@@ -1039,7 +893,7 @@ function getUsersFromDB() {
 function saveUsersToDB(users) {
   const normalizedUsers = normalizeUserList(Array.isArray(users) ? users : []);
   appStorage.setItem(USERS_DB_KEY, JSON.stringify(normalizedUsers));
-  pushCentralCloudDB();
+  triggerCloudSyncForKey(USERS_DB_KEY, normalizedUsers);
   if (currentUser) {
     loadDashboard();
     loadRiwayat();
@@ -1052,11 +906,71 @@ function getRequestsFromDB() {
 }
 
 function saveRequestsToDB(requests) {
-  appStorage.setItem(REQUESTS_DB_KEY, JSON.stringify(requests));
-  pushCentralCloudDB();
+  const normalizedRequests = Array.isArray(requests) ? requests : [];
+  appStorage.setItem(REQUESTS_DB_KEY, JSON.stringify(normalizedRequests));
+  triggerCloudSyncForKey(REQUESTS_DB_KEY, normalizedRequests);
   if (currentUser) {
     loadDashboard();
     loadRiwayat();
+    if (document.getElementById('masterDbTableBody')) loadMasterDbTable();
+  }
+}
+
+function saveCollectionToDB(storageKey, value) {
+  const normalizedValue = value === undefined ? [] : value;
+  appStorage.setItem(storageKey, JSON.stringify(normalizedValue));
+  triggerCloudSyncForKey(storageKey, normalizedValue);
+}
+
+function removeCollectionItem(storageKey, predicate) {
+  const currentItems = JSON.parse(appStorage.getItem(storageKey) || '[]');
+  const updatedItems = Array.isArray(currentItems) ? currentItems.filter(item => !predicate(item)) : [];
+  saveCollectionToDB(storageKey, updatedItems);
+  return updatedItems;
+}
+
+function upsertCollectionItem(storageKey, item, identityKey) {
+  const currentItems = JSON.parse(appStorage.getItem(storageKey) || '[]');
+  const nextItems = Array.isArray(currentItems) ? [...currentItems] : [];
+  const identity = item && item[identityKey] ? String(item[identityKey]) : null;
+
+  if (identity) {
+    const idx = nextItems.findIndex(existing => String(existing?.[identityKey] || '') === identity);
+    if (idx >= 0) nextItems[idx] = item;
+    else nextItems.push(item);
+  } else {
+    nextItems.push(item);
+  }
+
+  saveCollectionToDB(storageKey, nextItems);
+  return nextItems;
+}
+
+function triggerCloudSyncForKey(storageKey, value) {
+  if (typeof pushCentralCloudDB === 'function') {
+    try {
+      const sheetName = typeof mapStorageKeyToSheetName === 'function' ? mapStorageKeyToSheetName(storageKey) : null;
+      if (sheetName) {
+        const payload = Array.isArray(value) ? value : [value];
+        pendingWrites.set(storageKey, { __OP__: 'replace', items: payload });
+      }
+      pushCentralCloudDB();
+    } catch (err) {
+      console.warn('Cloud sync trigger failed:', err);
+    }
+  }
+}
+
+function syncDataToCloud(storageKey, value, options = {}) {
+  try {
+    const normalizedValue = value === undefined ? [] : value;
+    appStorage.setItem(storageKey, JSON.stringify(normalizedValue));
+    triggerCloudSyncForKey(storageKey, normalizedValue);
+    if (options.refresh) {
+      options.refresh();
+    }
+  } catch (err) {
+    console.warn('syncDataToCloud failed:', err);
   }
 }
 
@@ -1419,7 +1333,13 @@ function getAccessibleRequests() {
   }
 
   if (currentUser.category === 'TOKO') {
-    return requests.filter(r => r.userId === currentUser.id || r.toko.toUpperCase() === currentUser.fullName.toUpperCase() || r.area === currentUser.area);
+    const currentStoreName = String(currentUser.fullName || '').trim().toUpperCase();
+    return requests.filter(r => {
+      const requestUserId = String(r.userId || '').trim();
+      const requestStoreName = String(r.toko || '').trim().toUpperCase();
+      return requestUserId === String(currentUser.id || '').trim()
+        || (currentStoreName && requestStoreName === currentStoreName);
+    });
   }
 
   // All SERVICE users (including TSM) and SALES are scoped strictly to their own area
@@ -1501,9 +1421,11 @@ function bukaDetailDariDashboard(noSurat) {
 
 // DYNAMIC FORM MULTI-ROW ENGINE WITH CAMERA SCANNER TOOL IN EVERY SERIAL COLUMN
 function loadForm() {
-  document.getElementById('tanggal').value = getFormattedDateDDMMYYYY();
-
+  const tanggalEl = document.getElementById('tanggal');
   const tokoSelect = document.getElementById('toko');
+  if (!currentUser || !tokoSelect) return;
+
+  if (tanggalEl) tanggalEl.value = getFormattedDateDDMMYYYY();
   tokoSelect.innerHTML = '';
 
   if (currentUser.category === 'TOKO') {
@@ -1513,22 +1435,22 @@ function loadForm() {
     currentUser.category === 'DM' ||
     (currentUser.username && currentUser.username.toUpperCase() === 'ADMIN')
   ) {
-    // ADMIN & DM can select all stores across all areas
     const allStores = getStoresFromDB();
     if (allStores.length > 0) {
       allStores.forEach(s => {
-        tokoSelect.innerHTML += `<option value="${s.fullName}">${s.fullName} (${s.area})</option>`;
+        const label = `${String(s.fullName || '').trim()} (${String(s.area || '').trim()})`;
+        tokoSelect.add(new Option(label, String(s.fullName || '').trim()));
       });
     } else {
       tokoSelect.innerHTML = `<option value="TOKO SINAR ABADI">TOKO SINAR ABADI (BDG)</option>`;
     }
   } else {
-    // Service & Sales dibatasi khusus area user sendiri
     const allStores = getStoresFromDB();
     const areaStores = allStores.filter(s => s.area === currentUser.area);
     if (areaStores.length > 0) {
       areaStores.forEach(s => {
-        tokoSelect.innerHTML += `<option value="${s.fullName}">${s.fullName} (${s.area})</option>`;
+        const label = `${String(s.fullName || '').trim()} (${String(s.area || '').trim()})`;
+        tokoSelect.add(new Option(label, String(s.fullName || '').trim()));
       });
     } else {
       tokoSelect.innerHTML = `<option value="TOKO SINAR ABADI">TOKO SINAR ABADI (${currentUser.area})</option>`;
@@ -1541,76 +1463,6 @@ function loadForm() {
     bersihkanForm();
   }
 }
-
-// PLAIN TEXT STATUS WITH ROLE-BASED CONDITIONAL LABELS
-function getBadgeStatus(r) {
-  if (typeof r === 'string') {
-    if (r === 'DONE') return '<span>SUDAH DIPENUHI</span>';
-    return `<span>${r}</span>`;
-  }
-
-  if (!r) return '<span>-</span>';
-
-  const role = currentUser ? currentUser.category : '';
-  const st = r.status;
-  const serviceAppv = r.serviceApprove;
-
-  if (st === 'DONE') {
-    return '<span>SUDAH DIPENUHI</span>';
-  }
-
-  if (st === 'REJECT') {
-    return '<span>DITOLAK</span>';
-  }
-
-  if (st === 'APPROVE') {
-    return '<span>DISETUJUI</span>';
-  }
-
-  if (st === 'PENDING') {
-    if (!serviceAppv) {
-      if (role === 'DM') {
-        return '<span>TUNGGU SERVICE</span>';
-      }
-      return '<span>TUNGGU SERVICE</span>';
-    } else {
-      if (role === 'SERVICE' || role === 'TOKO' || role === 'SALES') {
-        return '<span>TUNGGU DM</span>';
-      }
-      return '<span>TUNGGU APPROVAL DM</span>';
-    }
-  }
-
-  return `<span>${st}</span>`;
-}
-
-// DYNAMIC FORM MULTI-ROW ENGINE WITH CAMERA SCANNER TOOL IN EVERY SERIAL COLUMN
-function loadForm() {
-  document.getElementById('tanggal').value = getFormattedDateDDMMYYYY();
-
-  const tokoSelect = document.getElementById('toko');
-  tokoSelect.innerHTML = '';
-
-  if (currentUser.category === 'TOKO') {
-    tokoSelect.innerHTML = `<option value="${currentUser.fullName}">${currentUser.fullName} (${currentUser.area})</option>`;
-  } else {
-    const users = getUsersFromDB();
-    // Filter toko khusus sesuai area user yang sedang login (hanya muncul area user saja)
-    const stores = users.filter(u => u.category === 'TOKO' && u.area === currentUser.area);
-    if (stores.length > 0) {
-      stores.forEach(s => {
-        tokoSelect.innerHTML += `<option value="${s.fullName}">${s.fullName} (${s.area})</option>`;
-      });
-    } else {
-      tokoSelect.innerHTML = `<option value="TOKO SINAR ABADI">TOKO SINAR ABADI (${currentUser.area})</option>`;
-    }
-  }
-
-  if (!modeEdit) {
-    bersihkanForm();
-  }
-}
-
 function gantiJenis() {
   const container = document.getElementById('detailContainer');
   if (container.children.length > 0 && !modeEdit) {
@@ -1874,77 +1726,15 @@ function kompresiFoto(file, maxDimension = 720, quality = 0.65) {
 }
 
 function pilihFoto() {
-  document.getElementById('foto').click();
+  showNotif('Fitur upload foto di-disable.', 'warning');
 }
 
 async function uploadPhotoToDriveCloud(file) {
-  try {
-    const compressedBase64 = await kompresiFoto(file, 720, 0.65);
-    if (!compressedBase64) return '';
-
-    const payload = {
-      action: 'uploadPhoto',
-      base64: compressedBase64,
-      fileName: `FOTO_${Date.now()}_${Math.floor(Math.random()*1000)}.jpg`
-    };
-
-    const targetUrl = GOOGLE_SHEET_WEBAPP_URL || PUBLIC_CLOUD_DB_URL;
-    const res = await fetch(targetUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload)
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      if (data && data.status === 'success' && data.url) {
-        return data.url;
-      }
-    }
-    return await kompresiFoto(file, 400, 0.4);
-  } catch (err) {
-    console.warn('Upload Drive Error, fallback base64:', err);
-    return await kompresiFoto(file, 400, 0.4);
-  }
+  return null;
 }
 
 async function previewFoto(event) {
-  const files = Array.from(event.target.files);
-  if (!files.length) return;
-
-  if (currentPhotos.length + files.length > 5) {
-    showNotif('MAKSIMAL FOTO DIBATASI HINGGA 5 FOTO!', 'warning');
-    return;
-  }
-
-  const previewText = document.getElementById('previewText');
-  const originalText = previewText ? previewText.innerHTML : 'TAP / DRAG FOTO DI SINI (MAKSIMAL 5 FOTO)';
-  if (previewText) {
-    previewText.innerHTML = `<span class="material-symbols-rounded" style="font-size:22px; vertical-align:middle; display:inline-block; animation:spin 0.8s linear infinite; color:var(--primary);">sync</span>`;
-  }
-
-  for (let i = 0; i < files.length; i++) {
-    if (currentPhotos.length < 5) {
-      try {
-        const driveUrl = await uploadPhotoToDriveCloud(files[i]);
-        if (driveUrl) {
-          currentPhotos.push(driveUrl);
-        }
-        if (i < files.length - 1) {
-          await new Promise(r => setTimeout(r, 350));
-        }
-      } catch (err) {
-        console.warn('Foto Upload Error:', err);
-      }
-    }
-  }
-
-  if (previewText) {
-    previewText.innerHTML = originalText;
-  }
-
-  renderPhotoGrid();
-  event.target.value = '';
+  showNotif('Fitur upload foto di-disable.', 'warning');
 }
 
 function hapusFotoItem(idx) {
@@ -2090,7 +1880,7 @@ function prosesSimpanKeDB(toko, jenis, catatan, items) {
         requests[idx].jenis = jenis;
         requests[idx].catatan = catatan;
         requests[idx].items = items;
-        requests[idx].photos = [...currentPhotos];
+        requests[idx].photos = [];
         saveRequestsToDB(requests);
         showNotif(`PERMINTAAN #${editNoSurat} BERHASIL DIPERBARUI!`, 'success');
         bersihkanForm();
@@ -2118,7 +1908,7 @@ function prosesSimpanKeDB(toko, jenis, catatan, items) {
         jenis,
         catatan,
         items,
-        photos: [...currentPhotos],
+        photos: [],
         status: 'PENDING',
         serviceApprove: false,
         createdBy: currentUser.fullName,
@@ -3275,6 +3065,7 @@ function simpanTTD() {
       ttdMap['HODS'] = png;
     }
     appStorage.setItem(TTD_DB_KEY, JSON.stringify(ttdMap));
+    triggerCloudSyncForKey(TTD_DB_KEY, ttdMap);
     pushCentralCloudDB();
     showNotif('TANDA TANGAN DIGITAL BERHASIL DISIMPAN!', 'info');
     tutupTTD();
@@ -3680,6 +3471,7 @@ function simpanUserData() {
     return value && value !== username && value.toUpperCase() !== username && value.toLowerCase() !== username.toLowerCase();
   });
   appStorage.setItem(DELETED_USERS_KEY, JSON.stringify(cleanDelUsers));
+  triggerCloudSyncForKey(DELETED_USERS_KEY, cleanDelUsers);
 
   const newUser = {
     id: `USR-${Date.now()}-${Math.floor(Math.random()*1000)}`,
@@ -3715,6 +3507,7 @@ function hapusUser(userId) {
     const delUsers = JSON.parse(appStorage.getItem(DELETED_USERS_KEY) || '[]');
     if (!delUsers.includes(userId)) delUsers.push(userId);
     appStorage.setItem(DELETED_USERS_KEY, JSON.stringify(delUsers));
+    triggerCloudSyncForKey(DELETED_USERS_KEY, delUsers);
 
     saveUsersToDB(users.filter(x => x.id !== userId));
     showNotif(`USER ${u.username} DIHAPUS.`, 'info');
@@ -3886,6 +3679,7 @@ function prosesUploadExcelLookup(event) {
         const existingMap = JSON.parse(appStorage.getItem(KODE_UNIT_MAP_KEY) || '{}');
         const updatedMap = { ...existingMap, ...newLookup };
         appStorage.setItem(KODE_UNIT_MAP_KEY, JSON.stringify(updatedMap));
+    triggerCloudSyncForKey(KODE_UNIT_MAP_KEY, updatedMap);
 
         // PUSH UPDATED EXCEL LOOKUP MAPPING TO GLOBAL CLOUD DATABASE WORLDWIDE
         pushCentralCloudDB();
@@ -4069,6 +3863,7 @@ function simpanTokoBaru() {
   };
   localStores.push(newStore);
   appStorage.setItem(STORES_DB_KEY, JSON.stringify(localStores));
+  triggerCloudSyncForKey(STORES_DB_KEY, localStores);
 
   // 2. Add directly into USERS_DB_KEY (Database Admin)
   const users = getUsersFromDB();
@@ -4109,6 +3904,7 @@ function hapusTokoCustom(id) {
     const localStores = JSON.parse(appStorage.getItem(STORES_DB_KEY) || '[]');
     const updatedLocal = localStores.filter(s => s.id !== id && s.fullName.toUpperCase() !== name.toUpperCase());
     appStorage.setItem(STORES_DB_KEY, JSON.stringify(updatedLocal));
+    triggerCloudSyncForKey(STORES_DB_KEY, updatedLocal);
 
     // 2. Add to DELETED_STORES_KEY blacklist
     const deletedStoreKeys = JSON.parse(appStorage.getItem(DELETED_STORES_KEY) || '[]');

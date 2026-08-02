@@ -9,17 +9,22 @@
     POST { action:'uploadImage', filename, imageBase64 } => stores image to configured folder, returns public link
 
   Notes:
-  - Sheet structure: each sheet (e.g., "chat", "requests") should have columns: key | value | updated_at (A,B,C)
+  - Sheet structure: each sheet (e.g., "chat", "requests") should have columns: source_key | record_id | data_json | updated_at (A-D)
   - For images, set folder sharing to "Anyone with link" after first upload or script will set sharing automatically.
   - onChange/e triggers can call notifySubscribers to push changes to configured webhook URLs.
 */
 
 const PROP_FOLDER_ID = 'FOLDER_ID';
 const PROP_SUBSCRIBERS = 'SUBSCRIBERS';
+const DEFAULT_SPREADSHEET_ID = '1PryP6ZpGyNEcFRyaRx-93wLn2lJ5qq5mMUj4jyxs3fc';
 
 function buildJsonResponse(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+function doOptions(e) {
+  return ContentService.createTextOutput('');
 }
 
 function doGet(e) {
@@ -46,10 +51,15 @@ function doPost(e) {
   let contentType = 'text/plain';
   
   try {
-    if (e && e.postData) {
+    if (e && e.postData && e.postData.contents) {
       contentType = e.postData.type || 'text/plain';
-      if (contentType.includes('json')) {
-        body = JSON.parse(e.postData.contents || '{}');
+      const raw = String(e.postData.contents || '').trim();
+      if (raw) {
+        try {
+          body = JSON.parse(raw);
+        } catch (jsonErr) {
+          body = e.parameter || {};
+        }
       } else {
         body = e.parameter || {};
       }
@@ -82,6 +92,78 @@ function getScriptProp(key) {
   return PropertiesService.getScriptProperties().getProperty(key) || null;
 }
 
+function getSpreadsheet() {
+  try {
+    const spreadsheetId = (getScriptProp('SPREADSHEET_ID') || DEFAULT_SPREADSHEET_ID).trim();
+    if (spreadsheetId) {
+      return SpreadsheetApp.openById(spreadsheetId);
+    }
+  } catch (err) {
+    // fallback to active spreadsheet
+  }
+
+  try {
+    return SpreadsheetApp.getActiveSpreadsheet();
+  } catch (err) {
+    throw new Error('Tidak bisa membuka spreadsheet. Pastikan Apps Script terhubung ke Google Sheet yang benar.');
+  }
+}
+
+function ensureSheetHeader(sh) {
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(['source_key', 'record_id', 'data_json', 'updated_at']);
+    return;
+  }
+
+  const firstRow = sh.getRange(1, 1, 1, 4).getValues()[0] || [];
+  if (!String(firstRow[0] || '').trim()) {
+    sh.getRange(1, 1, 1, 4).setValues([['source_key', 'record_id', 'data_json', 'updated_at']]);
+  }
+}
+
+function findExistingRowNumber(sh, key, recordId) {
+  const lastRow = sh.getLastRow();
+  if (lastRow <= 1) return null;
+
+  const values = sh.getRange(2, 1, lastRow - 1, 2).getValues();
+  for (let i = 0; i < values.length; i++) {
+    const rowKey = String(values[i][0] || '').trim();
+    const existingRecordId = String(values[i][1] || '').trim();
+    if (rowKey === key && existingRecordId === recordId) return i + 2;
+  }
+
+  for (let i = 0; i < values.length; i++) {
+    const existingRecordId = String(values[i][1] || '').trim();
+    if (existingRecordId && existingRecordId === recordId) return i + 2;
+  }
+
+  return null;
+}
+
+function dedupeSheetRows(sh, key) {
+  const lastRow = sh.getLastRow();
+  if (lastRow <= 2) return;
+
+  const values = sh.getRange(2, 1, lastRow - 1, 4).getValues();
+  const seen = new Set();
+  const rowsToDelete = [];
+
+  values.forEach((row, index) => {
+    const rowKey = String(row[0] || '').trim();
+    const recordId = String(row[1] || '').trim();
+    if (!recordId) return;
+
+    const fingerprint = `${rowKey}::${recordId}`;
+    if (seen.has(fingerprint)) {
+      rowsToDelete.push(index + 2);
+    } else {
+      seen.add(fingerprint);
+    }
+  });
+
+  rowsToDelete.reverse().forEach(rowNum => sh.deleteRow(rowNum));
+}
+
 function inferSheetName(key) {
   const map = {
     STORE_USERS_DB_V7_CLEAN: 'users',
@@ -107,7 +189,7 @@ function inferSheetName(key) {
 }
 
 function loadAllSheets() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = getSpreadsheet();
   const sheets = ss.getSheets();
   const out = [];
   sheets.forEach(sh => {
@@ -119,7 +201,7 @@ function loadAllSheets() {
 }
 
 function loadSheetRows(sheetName) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = getSpreadsheet();
   const sh = ss.getSheetByName(sheetName);
   if (!sh) return [];
   const values = sh.getDataRange().getValues();
@@ -138,8 +220,10 @@ function loadSheetRows(sheetName) {
 }
 
 function writeBatch(entries) {
-  // entries: [{ sheet, key, op: 'upsert'|'delete', value, updated_at }]
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const ss = getSpreadsheet();
   const result = [];
   entries.forEach(ent => {
     try {
@@ -149,91 +233,85 @@ function writeBatch(entries) {
       if (!key) { result.push({ key: null, ok: false, reason: 'missing_key' }); return; }
       const op = (ent.op || 'upsert').toString().toLowerCase();
 
-      if (sh.getLastRow() === 0) {
-        sh.appendRow(['source_key', 'record_id', 'data_json', 'updated_at']);
-      } else {
-        const firstRow = sh.getRange(1, 1, 1, 4).getValues()[0] || [];
-        if (!String(firstRow[0] || '').trim()) {
-          sh.getRange(1, 1, 1, 4).setValues([['source_key', 'record_id', 'data_json', 'updated_at']]);
-        }
-      }
+      ensureSheetHeader(sh);
 
       if (op === 'delete') {
         const lastRow = sh.getLastRow();
         if (lastRow > 1) {
-          const dataRange = sh.getRange(2, 1, lastRow - 1, 1).getValues();
-          for (let i = dataRange.length - 1; i >= 0; i--) {
-            if (String(dataRange[i][0] || '') === key) sh.deleteRow(i + 2);
-          }
+          const dataRange = sh.getRange(2, 1, lastRow - 1, 2).getValues();
+          const rowsToDelete = [];
+          dataRange.forEach((row, index) => {
+            const rowKey = String(row[0] || '').trim();
+            const recordId = String(row[1] || '').trim();
+            if (rowKey === key || recordId === key) rowsToDelete.push(index + 2);
+          });
+          rowsToDelete.reverse().forEach(rowNum => sh.deleteRow(rowNum));
         }
         result.push({ key, ok: true, op: 'delete' });
-      } else {
-        const now = ent.updated_at || new Date().toISOString();
-        const values = Array.isArray(ent.value) ? ent.value : [ent.value];
+        return;
+      }
 
-        // Ensure header exists
-        if (sh.getLastRow() === 0) {
-          sh.appendRow(['source_key', 'record_id', 'data_json', 'updated_at']);
-        }
+      const now = ent.updated_at || new Date().toISOString();
+      const rawValue = ent.value;
+      const values = Array.isArray(rawValue)
+        ? rawValue
+        : (rawValue === undefined || rawValue === null ? [] : [rawValue]);
 
-        // Read existing record_ids once to avoid repeated calls
-        const lastRow = sh.getLastRow();
-        let existingRecordIds = lastRow > 1 ? sh.getRange(2, 2, lastRow - 1, 1).getValues().map(r => String(r[0] || '')) : [];
+      if (op === 'replace' && sh.getLastRow() > 1) {
+        const rowsToDelete = Math.max(0, sh.getLastRow() - 1);
+        if (rowsToDelete > 0) sh.deleteRows(2, rowsToDelete);
+      }
 
-        // If replace operation, clear existing data rows first
-        if (op === 'replace' && lastRow > 1) {
-          sh.getRange(2, 1, lastRow - 1, 4).clearContent();
-          existingRecordIds = [];
-        }
+      values.forEach(item => {
+        if (item && typeof item === 'object' && !Array.isArray(item)) {
+          const recordId = String(item.id || item.noSurat || item.username || item.roomId || item.messageId || item.key || item.record_id || `${Date.now()}-${Math.random() * 1000}`);
+          let rowNum = null;
 
-        values.forEach(item => {
-          if (item && typeof item === 'object' && !Array.isArray(item)) {
-            const recordId = String(item.id || item.noSurat || item.username || item.roomId || item.messageId || `${Date.now()}-${Math.random() * 1000}`);
-            const idx = existingRecordIds.indexOf(recordId);
+          if (op === 'upsert' || op === 'append') {
+            rowNum = findExistingRowNumber(sh, key, recordId);
+          }
 
-            if (op === 'replace') {
-              // for replace we will append later after clearing; handle outside
-              sh.appendRow([key, recordId, JSON.stringify(item), now]);
-            } else if (op === 'upsert') {
-              if (idx !== -1) {
-                // update existing row
-                const rowNum = 2 + idx;
-                sh.getRange(rowNum, 3).setValue(JSON.stringify(item));
-                sh.getRange(rowNum, 4).setValue(now);
-              } else {
-                sh.appendRow([key, recordId, JSON.stringify(item), now]);
-                existingRecordIds.push(recordId);
-              }
-            } else if (op === 'append') {
-              // only append if not present
-              if (idx === -1) {
-                sh.appendRow([key, recordId, JSON.stringify(item), now]);
-                existingRecordIds.push(recordId);
-              }
+          if (op === 'replace') {
+            sh.appendRow([key, recordId, JSON.stringify(item), now]);
+          } else if (op === 'upsert') {
+            if (rowNum) {
+              sh.getRange(rowNum, 1, 1, 4).setValues([[key, recordId, JSON.stringify(item), now]]);
             } else {
-              // default fallback: append
+              sh.appendRow([key, recordId, JSON.stringify(item), now]);
+            }
+          } else if (op === 'append') {
+            if (!rowNum) {
               sh.appendRow([key, recordId, JSON.stringify(item), now]);
             }
           } else {
-            sh.appendRow([key, '', JSON.stringify(item), now]);
+            sh.appendRow([key, recordId, JSON.stringify(item), now]);
           }
-        });
+        } else {
+          const fallbackRecordId = (item && typeof item === 'string' && item.trim()) ? item : '';
+          sh.appendRow([key, fallbackRecordId, JSON.stringify(item), now]);
+        }
+      });
 
-        result.push({ key, ok: true, op: op });
-      }
+      dedupeSheetRows(sh, key);
+      result.push({ key, ok: true, op: op });
     } catch (err) {
       result.push({ key: ent.key || null, ok: false, reason: String(err) });
     }
   });
-  return result;
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function uploadImageToDrive(base64str, filename) {
   const folderId = getScriptProp(PROP_FOLDER_ID);
   if (!folderId) throw new Error('FOLDER_ID not configured in script properties');
   const contentType = detectContentTypeFromBase64(base64str) || 'image/jpeg';
+  if (!/^image\/(jpeg|png|gif|webp)$/i.test(contentType)) throw new Error('Tipe file gambar tidak didukung.');
   const data = Utilities.base64Decode(base64str.replace(/^data:[^;]+;base64,/, ''));
-  const blob = Utilities.newBlob(data, contentType, filename);
+  const safeFilename = String(filename || ('FOTO_' + Date.now() + '.jpg')).replace(/[^a-zA-Z0-9._-]/g, '_');
+  const blob = Utilities.newBlob(data, contentType, safeFilename);
   const folder = DriveApp.getFolderById(folderId);
   const file = folder.createFile(blob);
   // make file viewable by anyone with link

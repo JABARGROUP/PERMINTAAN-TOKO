@@ -208,7 +208,7 @@ body {
    - Dark themes: popup text will be white
    - Light theme: popup text will be dark
 */
-.popupNotifCard, .popupBantuan, .chatBox, .login-card, .popupOverlay, .popupTableScroll, .popupNotifCard * {
+.popupNotifCard, .popupBantuan, .chatBox, .login-card, .popupOverlay, .popupTableScroll {
   color: var(--popup-text, var(--text-main));
 }
 body.light-mode .popupNotifCard, body.light-mode .popupBantuan, body.light-mode .chatBox, body.light-mode .login-card { --popup-text: #111; }

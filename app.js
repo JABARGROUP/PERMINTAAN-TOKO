@@ -928,7 +928,7 @@ function clearAllAppCacheAndData(force = false) {
     FONTE_TOKEN_KEY,
     ADMIN_REMINDER_KEY,
     ADMIN_SECRET_KEY_STORAGE_KEY,
-    ADMIN_SCRIPT_URL_KEY
+    ADMIN_SCRIPT_URL_STORAGE_KEY
   ];
 
   sessionKeys.forEach(key => {

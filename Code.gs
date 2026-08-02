@@ -14,29 +14,41 @@
   - onChange/e triggers can call notifySubscribers to push changes to configured webhook URLs.
 */
 
-const PROP_FOLDER_ID = 'FOLDER_ID';
+const PROP_FOLDER_ID = '1rU2LjCSD3Uya6AjwOjuQGpDpwP-UVN5W';
 const PROP_SUBSCRIBERS = 'SUBSCRIBERS';
+
+function buildJsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON)
+    .setHeader('Access-Control-Allow-Origin', '*')
+    .setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    .setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
 
 function doGet(e) {
   const action = (e.parameter && e.parameter.action || '').toString().toLowerCase();
   try {
     if (action === 'loadall') {
       const data = loadAllSheets();
-      return ContentService.createTextOutput(JSON.stringify({ data })).setMimeType(ContentService.MimeType.JSON);
+      return buildJsonResponse({ data });
     }
 
     if (action === 'loadsheet' && e.parameter.sheet) {
       const rows = loadSheetRows(e.parameter.sheet);
-      return ContentService.createTextOutput(JSON.stringify({ sheet: e.parameter.sheet, rows })).setMimeType(ContentService.MimeType.JSON);
+      return buildJsonResponse({ sheet: e.parameter.sheet, rows });
     }
 
-    return ContentService.createTextOutput(JSON.stringify({ error: 'invalid_action' })).setMimeType(ContentService.MimeType.JSON);
+    return buildJsonResponse({ error: 'invalid_action' });
   } catch (err) {
-    return ContentService.createTextOutput(JSON.stringify({ error: String(err) })).setMimeType(ContentService.MimeType.JSON);
+    return buildJsonResponse({ error: String(err) });
   }
 }
 
 function doPost(e) {
+  if (e && e.parameter && e.parameter._postDataType === 'application/json') {
+    // no-op; handled below
+  }
+
   let body = {};
   try {
     if (e.postData && e.postData.type === 'application/json') {
@@ -45,26 +57,25 @@ function doPost(e) {
       body = e.parameter || {};
     }
   } catch (err) {
-    return ContentService.createTextOutput(JSON.stringify({ error: 'invalid_json' })).setMimeType(ContentService.MimeType.JSON);
+    return buildJsonResponse({ error: 'invalid_json' });
   }
 
   const action = (body.action || '').toString().toLowerCase();
   try {
     if (action === 'write' && Array.isArray(body.data)) {
       const result = writeBatch(body.data);
-      // notify subscribers that data changed
       notifySubscribers({ event: 'data_written', details: { written: result } });
-      return ContentService.createTextOutput(JSON.stringify({ ok: true, written: result })).setMimeType(ContentService.MimeType.JSON);
+      return buildJsonResponse({ ok: true, written: result });
     }
 
     if (action === 'uploadimage' && body.imageBase64 && body.filename) {
       const link = uploadImageToDrive(body.imageBase64, body.filename);
-      return ContentService.createTextOutput(JSON.stringify({ ok: true, url: link })).setMimeType(ContentService.MimeType.JSON);
+      return buildJsonResponse({ ok: true, url: link });
     }
 
-    return ContentService.createTextOutput(JSON.stringify({ error: 'invalid_action_or_missing_params' })).setMimeType(ContentService.MimeType.JSON);
+    return buildJsonResponse({ error: 'invalid_action_or_missing_params' });
   } catch (err) {
-    return ContentService.createTextOutput(JSON.stringify({ error: String(err) })).setMimeType(ContentService.MimeType.JSON);
+    return buildJsonResponse({ error: String(err) });
   }
 }
 

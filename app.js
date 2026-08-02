@@ -133,11 +133,12 @@ function getAccessibleNotifications() {
   const notifs = getSystemNotifications();
 
   return notifs.filter(n => {
-    const areaMatch = (n.targetArea === 'ALL' || currentUser.category === 'DM' || n.targetArea === currentUser.area);
+    const roles = Array.isArray(n && n.targetRoles) ? n.targetRoles : [];
+    const areaMatch = (String(n.targetArea || 'ALL') === 'ALL' || currentUser.category === 'DM' || String(n.targetArea || 'ALL') === currentUser.area);
     const roleMatch = (
-      n.targetRoles.includes('ALL') ||
-      n.targetRoles.includes(currentUser.category) ||
-      (currentUser.category === 'TOKO' && n.targetRoles.includes('TOKO'))
+      roles.includes('ALL') ||
+      roles.includes(currentUser.category) ||
+      (currentUser.category === 'TOKO' && roles.includes('TOKO'))
     );
     return areaMatch && roleMatch;
   });

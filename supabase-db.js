@@ -240,69 +240,57 @@ function mapSheetNameToStorageKey(sheetName) {
 }
 
 async function loadAllFromSupabase() {
-  const endpoint = getCloudEndpoint();
-  if (!endpoint) return;
-  try {
-    if (typeof endpoint === 'string') {
-      const finalUrl = endpoint.endsWith('?') ? endpoint + 'action=loadall' : endpoint + '?action=loadall';
-      console.log('📡 Fetching from:', finalUrl);
-      const resp = await fetch(finalUrl, { cache: 'no-store', method: 'GET' });
-      console.log('📡 Response status:', resp.status);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}: Failed to fetch from Sheets endpoint`);
-      const payload = await resp.json();
-      console.log('📡 Response:', payload);
-      
-      if (payload.error) {
-        throw new Error(`Server error: ${payload.error}. Action received: ${payload.action}`);
-      }
-      
-      if (payload && Array.isArray(payload.data)) {
-        payload.data.forEach(sheet => {
-          if (!sheet || !sheet.sheet) return;
-          const storageKey = mapSheetNameToStorageKey(sheet.sheet);
-          if (!storageKey) return;
-          const rows = Array.isArray(sheet.rows) ? sheet.rows : [];
-          const parsedRows = rows
-            .map(r => {
-              if (r && r.data_json !== undefined) {
-                const raw = r.data_json;
-                if (typeof raw === 'string') {
-                  try { return JSON.parse(raw); } catch { return raw; }
-                }
-                return raw;
-              }
-              return r;
-            })
-            .filter(item => item !== null && item !== undefined && item !== '');
 
-          if (parsedRows.length) {
-            memoryCache.set(storageKey, serializeForCache(parsedRows));
-          }
+    const endpoint = getCloudEndpoint();
+    if (!endpoint) return;
+
+    const finalUrl =
+        endpoint.replace(/\/$/, "") +
+        "?action=loadall";
+
+    console.log("📡 GET:", finalUrl);
+
+    const resp = await fetch(finalUrl, {
+        method: "GET",
+        cache: "no-store"
+    });
+
+    if (!resp.ok)
+        throw new Error("HTTP " + resp.status);
+
+    const payload = await resp.json();
+
+    if (payload.error)
+        throw new Error(payload.error);
+
+    if (!Array.isArray(payload.data))
+        return;
+
+    payload.data.forEach(sheet => {
+
+        const storageKey =
+            mapSheetNameToStorageKey(sheet.sheet);
+
+        if (!storageKey) return;
+
+        const rows = (sheet.rows || []).map(r => {
+
+            try {
+                return JSON.parse(r.data_json);
+            } catch {
+                return r.data_json;
+            }
+
         });
-        if (typeof onDataChangeCallback === 'function') onDataChangeCallback(null);
-      }
-    } else if (endpoint && endpoint.type === 'sheets_api') {
-      // Legacy fallback: read a simple sheet named app_storage
-      const sheetRange = 'app_storage!A:C';
-      const url = `https://sheets.googleapis.com/v4/spreadsheets/${endpoint.spreadsheetId}/values/${encodeURIComponent(sheetRange)}?key=${endpoint.apiKey}`;
-      const resp = await fetch(url, { cache: 'no-store' });
-      if (!resp.ok) throw new Error('Failed to fetch from Google Sheets API');
-      const payload = await resp.json();
-      if (payload && Array.isArray(payload.values)) {
-        payload.values.forEach(r => {
-          const key = r[0];
-          const val = r[1];
-          if (key) memoryCache.set(key, serializeForCache(val));
-        });
-        if (typeof onDataChangeCallback === 'function') onDataChangeCallback(null);
-      }
-    }
-  } catch (err) {
-    console.warn('loadAllFromSupabase error:', err.message);
-    throw err;
-  }
+
+        memoryCache.set(storageKey, serializeForCache(rows));
+
+    });
+
+    if (typeof onDataChangeCallback === "function")
+        onDataChangeCallback(null);
+
 }
-
 function schedulePersist(key, parsedValue) {
   pendingWrites.set(key, normalizeDateFields(parsedValue));
   if (writeTimer) clearTimeout(writeTimer);
@@ -316,44 +304,71 @@ function scheduleDelete(key) {
 }
 
 async function flushPendingWrites() {
-  const endpoint = getCloudEndpoint();
-  if (!endpoint || pendingWrites.size === 0) return;
 
-  const batch = [];
-  for (const [k, v] of pendingWrites) {
-    const sheet = mapStorageKeyToSheetName(k);
-    if (v && v.__DELETE__) {
-      batch.push({ key: k, sheet, op: 'delete' });
-    } else {
-      batch.push({ key: k, sheet, op: 'upsert', value: v });
-    }
-  }
-  pendingWrites.clear();
+    const endpoint = getCloudEndpoint();
 
-  try {
-    console.log('📡 Flushing writes to:', endpoint);
-    console.log('📡 Batch:', batch);
-    const resp = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'write', data: batch })
-    });
-    console.log('📡 Write response status:', resp.status);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}: Cloud write failed`);
-    const result = await resp.json();
-    console.log('📡 Write response:', result);
-    if (result.error) {
-      throw new Error(`Server error: ${result.error}`);
+    if (!endpoint || pendingWrites.size === 0) return;
+
+    const batch = [];
+
+    for (const [key, value] of pendingWrites.entries()) {
+
+        batch.push({
+            key: key,
+            sheet: mapStorageKeyToSheetName(key),
+            op: value && value.__DELETE__ ? "delete" : "upsert",
+            value: value && value.__DELETE__ ? undefined : value
+        });
+
     }
-    isSupabaseOnline = true;
-    updateSupabaseStatusUI(true);
-  } catch (err) {
-    console.warn('flushPendingWrites error:', err.message);
-    isSupabaseOnline = false;
-    updateSupabaseStatusUI(false);
-  }
+
+    pendingWrites.clear();
+
+    try {
+
+        const proxyUrl = endpoint.replace(/\/$/, "");
+
+        console.log("📡 POST:", proxyUrl);
+        console.log("📦 Batch:", batch);
+
+        const resp = await fetch(proxyUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                action: "write",
+                data: batch
+            })
+        });
+
+        console.log("📡 Status:", resp.status);
+
+        if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}`);
+        }
+
+        const result = await resp.json();
+
+        console.log("📡 Response:", result);
+
+        if (result.error) {
+            throw new Error(result.error);
+        }
+
+        isSupabaseOnline = true;
+        updateSupabaseStatusUI(true);
+
+    } catch (err) {
+
+        console.error("flushPendingWrites:", err);
+
+        isSupabaseOnline = false;
+        updateSupabaseStatusUI(false);
+
+    }
+
 }
-
 async function pushToSupabaseNow() {
   if (writeTimer) { clearTimeout(writeTimer); writeTimer = null; }
   await flushPendingWrites();
@@ -388,42 +403,57 @@ async function seedSupabaseDefaults(defaults) {
 }
 
 async function uploadPhotoToSupabaseStorage(file, fileName) {
-  const endpoint = getCloudEndpoint();
-  if (!endpoint || typeof endpoint !== 'string') {
-    console.warn('No Apps Script upload endpoint configured.');
-    return null;
-  }
 
-  function readFileAsDataURL(f) {
-    return new Promise((resolve, reject) => {
-      try {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = (e) => reject(e);
-        reader.readAsDataURL(f);
-      } catch (err) {
-        reject(err);
-      }
-    });
-  }
+    const endpoint = getCloudEndpoint();
 
-  try {
-    const name = fileName || (file && file.name) || `photo_${Date.now()}`;
-    const dataUrl = await readFileAsDataURL(file);
-    const resp = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'uploadImage', filename: name, imageBase64: dataUrl })
-    });
-    if (!resp.ok) throw new Error('Upload failed');
-    const payload = await resp.json();
-    return payload && payload.url ? payload.url : null;
-  } catch (err) {
-    console.warn('uploadPhotoToSupabaseStorage error:', err.message);
-    return null;
-  }
+    if (!endpoint || typeof endpoint !== "string") {
+        console.warn("No Apps Script endpoint configured.");
+        return null;
+    }
+
+    function readFileAsDataURL(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
+        });
+    }
+
+    try {
+
+        const dataUrl = await readFileAsDataURL(file);
+
+        const resp = await fetch(endpoint.replace(/\/$/, ""), {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                action: "uploadImage",
+                filename: fileName || file.name,
+                imageBase64: dataUrl
+            })
+        });
+
+        if (!resp.ok)
+            throw new Error("HTTP " + resp.status);
+
+        const json = await resp.json();
+
+        if (json.error)
+            throw new Error(json.error);
+
+        return json.url;
+
+    } catch (err) {
+
+        console.error(err);
+        return null;
+
+    }
+
 }
-
 function updateSupabaseStatusUI(isOnline) {
   const badge = document.getElementById('cloudStatusBadge');
   if (!badge) return;

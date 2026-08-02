@@ -632,7 +632,7 @@ function onSupabaseDataChange() {
   loadRiwayat();
   if (document.getElementById('userTableBody')) loadUsersManagement();
   if (document.getElementById('masterDbTableBody')) loadMasterDbTable();
-  loadTokoDropdown();
+  // loadTokoDropdown() - function not defined, commented out
   updatePhotoSectionVisibility();
   updateNotifBellCounter();
 

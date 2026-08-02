@@ -244,9 +244,18 @@ async function loadAllFromSupabase() {
   if (!endpoint) return;
   try {
     if (typeof endpoint === 'string') {
-      const resp = await fetch(`${endpoint}?action=loadAll`, { cache: 'no-store' });
-      if (!resp.ok) throw new Error('Failed to fetch from Sheets endpoint');
+      const finalUrl = endpoint.endsWith('?') ? endpoint + 'action=loadall' : endpoint + '?action=loadall';
+      console.log('📡 Fetching from:', finalUrl);
+      const resp = await fetch(finalUrl, { cache: 'no-store', method: 'GET' });
+      console.log('📡 Response status:', resp.status);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}: Failed to fetch from Sheets endpoint`);
       const payload = await resp.json();
+      console.log('📡 Response:', payload);
+      
+      if (payload.error) {
+        throw new Error(`Server error: ${payload.error}. Action received: ${payload.action}`);
+      }
+      
       if (payload && Array.isArray(payload.data)) {
         payload.data.forEach(sheet => {
           if (!sheet || !sheet.sheet) return;
@@ -322,12 +331,20 @@ async function flushPendingWrites() {
   pendingWrites.clear();
 
   try {
+    console.log('📡 Flushing writes to:', endpoint);
+    console.log('📡 Batch:', batch);
     const resp = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action: 'write', data: batch })
     });
-    if (!resp.ok) throw new Error('Cloud write failed');
+    console.log('📡 Write response status:', resp.status);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: Cloud write failed`);
+    const result = await resp.json();
+    console.log('📡 Write response:', result);
+    if (result.error) {
+      throw new Error(`Server error: ${result.error}`);
+    }
     isSupabaseOnline = true;
     updateSupabaseStatusUI(true);
   } catch (err) {

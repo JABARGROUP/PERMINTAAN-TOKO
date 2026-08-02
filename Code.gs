@@ -23,56 +23,58 @@ function buildJsonResponse(obj) {
 }
 
 function doGet(e) {
-  const action = (e.parameter && e.parameter.action || '').toString().toLowerCase();
+  const action = (e.parameter && e.parameter.action || '').toString().toLowerCase().trim();
   try {
     if (action === 'loadall') {
       const data = loadAllSheets();
-      return buildJsonResponse({ data });
+      return buildJsonResponse({ success: true, data });
     }
 
-    if (action === 'loadsheet' && e.parameter.sheet) {
+    if (action === 'loadsheet' && e.parameter && e.parameter.sheet) {
       const rows = loadSheetRows(e.parameter.sheet);
-      return buildJsonResponse({ sheet: e.parameter.sheet, rows });
+      return buildJsonResponse({ success: true, sheet: e.parameter.sheet, rows });
     }
 
-    return buildJsonResponse({ error: 'invalid_action' });
+    return buildJsonResponse({ error: 'invalid_action_or_missing_params', action: action, params: e.parameter });
   } catch (err) {
-    return buildJsonResponse({ error: String(err) });
+    return buildJsonResponse({ error: String(err), errorType: 'GET_ERROR' });
   }
 }
 
 function doPost(e) {
-  if (e && e.parameter && e.parameter._postDataType === 'application/json') {
-    // no-op; handled below
-  }
-
   let body = {};
+  let contentType = 'text/plain';
+  
   try {
-    if (e.postData && e.postData.type === 'application/json') {
-      body = JSON.parse(e.postData.contents || '{}');
+    if (e && e.postData) {
+      contentType = e.postData.type || 'text/plain';
+      if (contentType.includes('json')) {
+        body = JSON.parse(e.postData.contents || '{}');
+      } else {
+        body = e.parameter || {};
+      }
     } else {
       body = e.parameter || {};
     }
   } catch (err) {
-    return buildJsonResponse({ error: 'invalid_json' });
+    return buildJsonResponse({ error: 'invalid_json', details: String(err) });
   }
 
-  const action = (body.action || '').toString().toLowerCase();
+  const action = (body.action || '').toString().toLowerCase().trim();
   try {
     if (action === 'write' && Array.isArray(body.data)) {
       const result = writeBatch(body.data);
-      notifySubscribers({ event: 'data_written', details: { written: result } });
-      return buildJsonResponse({ ok: true, written: result });
+      return buildJsonResponse({ success: true, ok: true, written: result });
     }
 
     if (action === 'uploadimage' && body.imageBase64 && body.filename) {
       const link = uploadImageToDrive(body.imageBase64, body.filename);
-      return buildJsonResponse({ ok: true, url: link });
+      return buildJsonResponse({ success: true, ok: true, url: link });
     }
 
-    return buildJsonResponse({ error: 'invalid_action_or_missing_params' });
+    return buildJsonResponse({ error: 'invalid_action_or_missing_params', action: action, received: body });
   } catch (err) {
-    return buildJsonResponse({ error: String(err) });
+    return buildJsonResponse({ error: String(err), errorType: 'POST_ERROR', action: action });
   }
 }
 

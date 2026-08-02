@@ -1,43 +1,20 @@
 /* ======================================================
-   SUPABASE DATABASE ENGINE
-   Menggantikan localStorage + Firebase + Cloud Sync
+   GOOGLE SHEETS (APPS SCRIPT) DATABASE ADAPTER
+   Replaces Supabase client with a simple Apps Script HTTP endpoint
+   Expected endpoint: deploy a Google Apps Script Web App that accepts
+   GET ?action=loadAll and POST with { action: 'write', data: [...] }
 ====================================================== */
 
-let APP_SUPABASE_URL = 'https://ducrykojvabaoioigbgc.supabase.co';
-let APP_SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_H2w50rrXQWKqZM2fKZJXBw_sRsEpwNf';
-
-async function loadSupabaseConfigFromJson() {
-  try {
-    const response = await fetch('./supabase-config.json?v=20260801_supabase_fix_3', { cache: 'no-store' });
-    if (!response.ok) return;
-    const config = await response.json();
-    if (config.SUPABASE_URL) APP_SUPABASE_URL = String(config.SUPABASE_URL).trim();
-    if (config.SUPABASE_PUBLISHABLE_KEY) APP_SUPABASE_PUBLISHABLE_KEY = String(config.SUPABASE_PUBLISHABLE_KEY).trim();
-    if (config.SUPABASE_SECRET_KEY) {
-      window.APP_SUPABASE_SECRET_KEY = String(config.SUPABASE_SECRET_KEY).trim();
-    }
-    if (config.SUPABASE_JWKS_URL) {
-      window.APP_SUPABASE_JWKS_URL = String(config.SUPABASE_JWKS_URL).trim();
-    }
-  } catch (err) {
-    console.warn('Supabase config JSON tidak terbaca:', err.message);
-  }
-}
-
-let supabaseClient = null;
-let isSupabaseReady = false;
-let isSupabaseOnline = false;
-let pendingWrites = new Map();
-let writeTimer = null;
-let realtimeChannel = null;
-let onDataChangeCallback = null;
-
-/** In-memory cache — digunakan sebagai fallback, tetapi data utama disimpan di localStorage */
 const memoryCache = new Map();
-
-/** Session & tema disimpan di localStorage agar tidak hilang saat reload */
 const sessionKey = window.SESSION_KEY || 'STORE_ACTIVE_SESSION_V7_CLEAN';
 const themeKey = window.THEME_KEY || 'STORE_ACTIVE_THEME_V7_CLEAN';
+const ADMIN_SCRIPT_URL_KEY = window.ADMIN_SCRIPT_URL_KEY || 'STORE_ADMIN_SCRIPT_URL_V7_CLEAN';
+
+let pendingWrites = new Map();
+let writeTimer = null;
+let isSupabaseReady = false; // kept for compatibility with app.js
+let isSupabaseOnline = false;
+let onDataChangeCallback = null;
 
 const appStorage = {
   getItem(key) {
@@ -48,7 +25,7 @@ const appStorage = {
         return localValue;
       }
     } catch (err) {
-      // fall through to memory cache
+      // fallback to memory cache
     }
 
     if (!memoryCache.has(key)) return null;
@@ -60,7 +37,8 @@ const appStorage = {
     const strVal = String(value);
     memoryCache.set(key, strVal);
     try {
-      if (window.localStorage) {
+      // Persist to localStorage ONLY for session (user login/password)
+      if (window.localStorage && key === sessionKey) {
         window.localStorage.setItem(key, strVal);
       }
     } catch (err) {
@@ -72,7 +50,7 @@ const appStorage = {
   removeItem(key) {
     memoryCache.delete(key);
     try {
-      if (window.localStorage) {
+      if (window.localStorage && key === sessionKey) {
         window.localStorage.removeItem(key);
       }
     } catch (err) {
@@ -82,19 +60,16 @@ const appStorage = {
   },
 
   clear() {
-    const keepKeys = new Set([sessionKey, themeKey]);
+    // Keep only session in localStorage
+    const keepKeys = new Set([sessionKey]);
     [...memoryCache.keys()].forEach(k => {
-      if (!keepKeys.has(k)) {
-        memoryCache.delete(k);
-      }
+      if (!keepKeys.has(k)) memoryCache.delete(k);
     });
 
     try {
       if (window.localStorage) {
         Object.keys(window.localStorage).forEach(k => {
-          if (!keepKeys.has(k) && (String(k).startsWith('STORE_') || String(k).startsWith('FIREBASE_'))) {
-            window.localStorage.removeItem(k);
-          }
+          if (!keepKeys.has(k)) window.localStorage.removeItem(k);
         });
       }
     } catch (err) {
@@ -104,11 +79,7 @@ const appStorage = {
 };
 
 function parseStorageValue(strVal) {
-  try {
-    return JSON.parse(strVal);
-  } catch {
-    return strVal;
-  }
+  try { return JSON.parse(strVal); } catch { return strVal; }
 }
 
 function serializeForCache(value) {
@@ -117,63 +88,60 @@ function serializeForCache(value) {
   return JSON.stringify(value);
 }
 
-function getSupabaseClient() {
-  return supabaseClient;
+function setOnDataChangeCallback(fn) { onDataChangeCallback = fn; }
+
+async function loadSupabaseConfigFromJson() {
+  // kept name for compatibility: will try to load ./sheets-config.json
+  try {
+    const resp = await fetch('./sheets-config.json?v=20260802', { cache: 'no-store' });
+    if (!resp.ok) return;
+    const cfg = await resp.json();
+    if (cfg) {
+      if (cfg.SHEETS_ENDPOINT) {
+        window.APP_SHEETS_ENDPOINT = String(cfg.SHEETS_ENDPOINT).trim();
+      }
+      if (cfg.SPREADSHEET_ID) {
+        window.APP_SHEETS_SPREADSHEET_ID = String(cfg.SPREADSHEET_ID).trim();
+      }
+      if (cfg.SHEETS_API_KEY) {
+        window.APP_SHEETS_API_KEY = String(cfg.SHEETS_API_KEY).trim();
+      }
+    }
+  } catch (err) {
+    // ignore
+  }
 }
 
-function isDbReady() {
-  return isSupabaseReady;
-}
-
-function setOnDataChangeCallback(fn) {
-  onDataChangeCallback = fn;
+function getCloudEndpoint() {
+  // Priority: explicit Apps Script endpoint -> built Sheets API (spreadsheetId + apiKey) -> stored admin script URL
+  if (window.APP_SHEETS_ENDPOINT) return window.APP_SHEETS_ENDPOINT;
+  if (window.APP_SHEETS_SPREADSHEET_ID && window.APP_SHEETS_API_KEY) {
+    return { type: 'sheets_api', spreadsheetId: window.APP_SHEETS_SPREADSHEET_ID, apiKey: window.APP_SHEETS_API_KEY };
+  }
+  const stored = (appStorage.getItem(ADMIN_SCRIPT_URL_KEY) || '').trim();
+  return stored || null;
 }
 
 async function initSupabaseDB(secretKey = null) {
-  if (typeof supabase === 'undefined' || !supabase.createClient) {
-    console.error('Supabase JS library belum dimuat!');
+  // Initialize by attempting to load all data from the configured Apps Script endpoint.
+  const endpoint = getCloudEndpoint();
+  if (!endpoint) {
+    isSupabaseReady = false;
+    isSupabaseOnline = false;
     updateSupabaseStatusUI(false);
+    console.warn('No Google Sheets endpoint configured. Running in local-memory mode.');
     return false;
   }
 
-  const apiKey = (secretKey && secretKey.trim()) ? secretKey.trim() : APP_SUPABASE_PUBLISHABLE_KEY;
-
   try {
-    if (supabaseClient) {
-      if (realtimeChannel) {
-        await supabaseClient.removeChannel(realtimeChannel);
-        realtimeChannel = null;
-      }
-    }
-
-    supabaseClient = supabase.createClient(APP_SUPABASE_URL, apiKey, {
-      realtime: { params: { eventsPerSecond: 10 } }
-    });
-
-    try {
-      await loadAllFromSupabase();
-      setupRealtimeSubscription();
-      isSupabaseReady = true;
-      isSupabaseOnline = true;
-      updateSupabaseStatusUI(true);
-      console.log('✅ SUPABASE TERHUBUNG');
-      return true;
-    } catch (dbErr) {
-      const msg = String(dbErr?.message || dbErr || '');
-      const isMissingTable = /does not exist|relation .*app_storage|app_storage.*not exist|permission/i.test(msg);
-
-      if (isMissingTable) {
-        console.warn('⚠️ TABEL app_storage belum dibuat di Supabase. Aplikasi tetap berjalan di mode local-memory.');
-        isSupabaseReady = false;
-        isSupabaseOnline = false;
-        updateSupabaseStatusUI(false);
-        return false;
-      }
-
-      throw dbErr;
-    }
+    await loadAllFromSupabase();
+    isSupabaseReady = true;
+    isSupabaseOnline = true;
+    updateSupabaseStatusUI(true);
+    console.log('✅ CLOUD (Sheets) TERHUBUNG');
+    return true;
   } catch (err) {
-    console.error('⚠️ SUPABASE GAGAL TERHUBUNG:', err.message);
+    console.warn('Cloud init failed:', err.message);
     isSupabaseReady = false;
     isSupabaseOnline = false;
     updateSupabaseStatusUI(false);
@@ -182,56 +150,40 @@ async function initSupabaseDB(secretKey = null) {
 }
 
 async function loadAllFromSupabase() {
-  if (!supabaseClient) return;
-
-  const { data, error } = await supabaseClient
-    .from('app_storage')
-    .select('key, value');
-
-  if (error) {
-    const msg = String(error?.message || error || '');
-    const isMissingTable = /does not exist|relation .*app_storage|app_storage.*not exist|permission/i.test(msg);
-    if (isMissingTable) {
-      console.warn('Tabel app_storage belum dibuat di Supabase, skip sync ke cloud.');
-      return;
-    }
-    throw error;
-  }
-
-  if (Array.isArray(data)) {
-    data.forEach(row => {
-      memoryCache.set(row.key, serializeForCache(row.value));
-    });
-  }
-}
-
-function setupRealtimeSubscription() {
-  if (!supabaseClient) return;
-
+  const endpoint = getCloudEndpoint();
+  if (!endpoint) return;
   try {
-    realtimeChannel = supabaseClient
-      .channel('app_storage_changes')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'app_storage' },
-        payload => {
-          const row = payload.new || payload.old;
-          if (!row || !row.key) return;
-
-          if (payload.eventType === 'DELETE') {
-            memoryCache.delete(row.key);
-          } else {
-            memoryCache.set(row.key, serializeForCache(row.value));
-          }
-
-          if (typeof onDataChangeCallback === 'function') {
-            onDataChangeCallback(row.key);
-          }
-        }
-      )
-      .subscribe();
+    if (typeof endpoint === 'string') {
+      const resp = await fetch(`${endpoint}?action=loadAll`, { cache: 'no-store' });
+      if (!resp.ok) throw new Error('Failed to fetch from Sheets endpoint');
+      const payload = await resp.json();
+      if (payload && Array.isArray(payload.data)) {
+        payload.data.forEach(row => {
+          if (row && row.key) memoryCache.set(row.key, serializeForCache(row.value));
+        });
+        if (typeof onDataChangeCallback === 'function') onDataChangeCallback(null);
+      }
+    } else if (endpoint && endpoint.type === 'sheets_api') {
+      // Read from Google Sheets API: expects a sheet named 'app_storage' with columns: key,value,updated_at
+      const sheetRange = 'app_storage!A:C';
+      const url = `https://sheets.googleapis.com/v4/spreadsheets/${endpoint.spreadsheetId}/values/${encodeURIComponent(sheetRange)}?key=${endpoint.apiKey}`;
+      const resp = await fetch(url, { cache: 'no-store' });
+      if (!resp.ok) throw new Error('Failed to fetch from Google Sheets API');
+      const payload = await resp.json();
+      // payload.values is array of rows
+      if (payload && Array.isArray(payload.values)) {
+        payload.values.forEach(r => {
+          // expect [key, value, updated_at]
+          const key = r[0];
+          const val = r[1];
+          if (key) memoryCache.set(key, serializeForCache(val));
+        });
+        if (typeof onDataChangeCallback === 'function') onDataChangeCallback(null);
+      }
+    }
   } catch (err) {
-    console.warn('Realtime subscription dibatalkan:', err.message);
+    console.warn('loadAllFromSupabase error:', err.message);
+    throw err;
   }
 }
 
@@ -248,118 +200,101 @@ function scheduleDelete(key) {
 }
 
 async function flushPendingWrites() {
-  if (!supabaseClient || pendingWrites.size === 0) return;
+  const endpoint = getCloudEndpoint();
+  if (!endpoint || pendingWrites.size === 0) return;
 
-  const batch = new Map(pendingWrites);
-  pendingWrites.clear();
-
-  for (const [key, val] of batch) {
-    try {
-      if (val && val.__DELETE__) {
-        await supabaseClient.from('app_storage').delete().eq('key', key);
-      } else {
-        await supabaseClient.from('app_storage').upsert({
-          key,
-          value: val,
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'key' });
-      }
-    } catch (err) {
-      console.warn('Supabase write error:', key, err.message);
-      isSupabaseOnline = false;
-      updateSupabaseStatusUI(false);
+  const batch = [];
+  for (const [k, v] of pendingWrites) {
+    if (v && v.__DELETE__) {
+      batch.push({ key: k, op: 'delete' });
+    } else {
+      batch.push({ key: k, op: 'upsert', value: v });
     }
   }
+  pendingWrites.clear();
 
-  isSupabaseOnline = true;
-  updateSupabaseStatusUI(true);
+  try {
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'write', data: batch })
+    });
+    if (!resp.ok) throw new Error('Cloud write failed');
+    isSupabaseOnline = true;
+    updateSupabaseStatusUI(true);
+  } catch (err) {
+    console.warn('flushPendingWrites error:', err.message);
+    isSupabaseOnline = false;
+    updateSupabaseStatusUI(false);
+  }
 }
 
 async function pushToSupabaseNow() {
-  if (writeTimer) {
-    clearTimeout(writeTimer);
-    writeTimer = null;
-  }
+  if (writeTimer) { clearTimeout(writeTimer); writeTimer = null; }
   await flushPendingWrites();
 }
 
 async function pullFromSupabase() {
-  if (!supabaseClient) return false;
   try {
     await loadAllFromSupabase();
     isSupabaseOnline = true;
     updateSupabaseStatusUI(true);
     return true;
   } catch (err) {
-    console.warn('Supabase pull error:', err.message);
     isSupabaseOnline = false;
     updateSupabaseStatusUI(false);
     return false;
   }
 }
 
-let supabaseKeepaliveTimer = null;
-
 function startSupabaseKeepalive() {
-  if (supabaseKeepaliveTimer) return;
-
-  const pingSupabase = async () => {
-    if (!supabaseClient) {
-      await initSupabaseDB();
-      return;
-    }
-
-    try {
-      const { error } = await supabaseClient.from('app_storage').select('key').limit(1);
-      if (error) throw error;
-      isSupabaseOnline = true;
-      updateSupabaseStatusUI(true);
-    } catch (err) {
-      console.warn('Supabase keepalive failed:', err.message);
-      isSupabaseOnline = false;
-      updateSupabaseStatusUI(false);
-    }
-  };
-
-  pingSupabase();
-  supabaseKeepaliveTimer = setInterval(pingSupabase, 24 * 60 * 60 * 1000);
+  // No-op keepalive; optionally could ping endpoint periodically.
 }
 
 async function seedSupabaseDefaults(defaults) {
-  if (!supabaseClient) return;
-
-  const { data } = await supabaseClient.from('app_storage').select('key').limit(1);
-  if (data && data.length > 0) return;
-
-  const rows = Object.entries(defaults).map(([key, value]) => ({
-    key,
-    value: parseStorageValue(typeof value === 'string' ? value : JSON.stringify(value)),
-    updated_at: new Date().toISOString()
-  }));
-
-  if (rows.length) {
-    await supabaseClient.from('app_storage').upsert(rows, { onConflict: 'key' });
-    rows.forEach(r => memoryCache.set(r.key, serializeForCache(r.value)));
-  }
+  // Write defaults to memory and schedule persist; actual cloud seeding
+  // depends on the configured Apps Script implementation.
+  Object.entries(defaults || {}).forEach(([k, v]) => {
+    if (!memoryCache.has(k)) {
+      memoryCache.set(k, serializeForCache(v));
+      schedulePersist(k, v);
+    }
+  });
 }
 
-async function uploadPhotoToSupabaseStorage(file) {
-  if (!supabaseClient) return null;
+async function uploadPhotoToSupabaseStorage(file, fileName) {
+  const endpoint = getCloudEndpoint();
+  if (!endpoint || typeof endpoint !== 'string') {
+    console.warn('No Apps Script upload endpoint configured.');
+    return null;
+  }
+
+  function readFileAsDataURL(f) {
+    return new Promise((resolve, reject) => {
+      try {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = (e) => reject(e);
+        reader.readAsDataURL(f);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
 
   try {
-    const ext = (file.name && file.name.split('.').pop()) || 'jpg';
-    const fileName = `FOTO_${Date.now()}_${Math.floor(Math.random() * 10000)}.${ext}`;
-
-    const { error } = await supabaseClient.storage
-      .from('photos')
-      .upload(fileName, file, { cacheControl: '3600', upsert: false });
-
-    if (error) throw error;
-
-    const { data } = supabaseClient.storage.from('photos').getPublicUrl(fileName);
-    return data?.publicUrl || null;
+    const name = fileName || (file && file.name) || `photo_${Date.now()}`;
+    const dataUrl = await readFileAsDataURL(file);
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'uploadImage', filename: name, imageBase64: dataUrl })
+    });
+    if (!resp.ok) throw new Error('Upload failed');
+    const payload = await resp.json();
+    return payload && payload.url ? payload.url : null;
   } catch (err) {
-    console.warn('Supabase Storage upload error:', err.message);
+    console.warn('uploadPhotoToSupabaseStorage error:', err.message);
     return null;
   }
 }
@@ -367,24 +302,20 @@ async function uploadPhotoToSupabaseStorage(file) {
 function updateSupabaseStatusUI(isOnline) {
   const badge = document.getElementById('cloudStatusBadge');
   if (!badge) return;
-
   if (isOnline) {
     badge.style.background = 'rgba(16, 185, 129, 0.18)';
     badge.style.color = '#10b981';
     badge.style.borderColor = 'rgba(16, 185, 129, 0.35)';
-    badge.innerHTML = '<span class="material-symbols-rounded" style="font-size: 15px;">cloud_done</span> SUPABASE ONLINE';
+    badge.innerHTML = '<span class="material-symbols-rounded" style="font-size: 15px;">cloud_done</span> CLOUD ONLINE';
   } else {
     badge.style.background = 'rgba(239, 68, 68, 0.18)';
     badge.style.color = '#ef4444';
     badge.style.borderColor = 'rgba(239, 68, 68, 0.35)';
-    badge.innerHTML = '<span class="material-symbols-rounded" style="font-size: 15px;">cloud_off</span> SUPABASE OFFLINE';
+    badge.innerHTML = '<span class="material-symbols-rounded" style="font-size: 15px;">cloud_off</span> CLOUD OFFLINE';
   }
 }
 
-function toggleAdminSecretKeyField() {
-  // Secret key is now managed only in the user management settings panel.
-  // The login form no longer asks for the key to keep the flow simple.
-}
+function toggleAdminSecretKeyField() { /* kept for compatibility */ }
 
 window.initSupabaseDB = initSupabaseDB;
 window.pushToSupabaseNow = pushToSupabaseNow;

@@ -14,15 +14,12 @@
   - onChange/e triggers can call notifySubscribers to push changes to configured webhook URLs.
 */
 
-const PROP_FOLDER_ID = '1rU2LjCSD3Uya6AjwOjuQGpDpwP-UVN5W';
+const PROP_FOLDER_ID = 'FOLDER_ID';
 const PROP_SUBSCRIBERS = 'SUBSCRIBERS';
 
 function buildJsonResponse(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON)
-    .setHeader('Access-Control-Allow-Origin', '*')
-    .setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    .setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 function doGet(e) {

@@ -4,14 +4,6 @@
  * Database tunggal: Google Sheets.
  * Frontend GitHub Pages TIDAK berbicara langsung ke Spreadsheet API.
  * Semua akses melewati Web App Apps Script ini.
- *
- * GET  : JSONP untuk membaca data tanpa masalah CORS.
- * POST : text/plain + no-cors dari browser untuk menulis data.
- *       Setelah POST, frontend melakukan verifikasi GET/JSONP.
- *
- * Deploy Web App:
- *   Execute as: Me
- *   Who has access: Anyone
  */
 
 const PROP_SPREADSHEET_ID = 'SPREADSHEET_ID';
@@ -90,7 +82,6 @@ function doGet(e) {
         time: new Date().toISOString()
       };
     } else if (action === 'loadall') {
-      // READ MUST BE FAST. Do not run repair/dedup during every page load.
       payload = { success: true, ok: true, data: loadAllSheets() };
     } else if (action === 'repair') {
       cleanupDuplicateRowsOnce();
@@ -132,6 +123,12 @@ function doPost(e) {
       return jsonText({ success: true, ok: true, written: result });
     }
 
+    // WA PROXY HANDLER (BARU)
+    if (action === 'sendwa' && body.target && body.message && body.token) {
+      const waRes = sendWaNotification(body.target, body.message, body.token);
+      return jsonText({ success: true, ok: true, result: waRes });
+    }
+
     if (action === 'uploadimage' && body.imageBase64 && body.filename) {
       const url = uploadImageToDrive(body.imageBase64, body.filename);
       return jsonText({ success: true, ok: true, url: url });
@@ -140,6 +137,37 @@ function doPost(e) {
     return jsonText({ success: false, ok: false, error: 'invalid_action', action: action });
   } catch (err) {
     return jsonText({ success: false, ok: false, error: String(err), errorType: 'POST_ERROR', action: action });
+  }
+}
+
+// FUNGSI NOTIFIKASI WA BACKEND (AMAN DARI CORS)
+function sendWaNotification(target, message, token) {
+  let cleanPhone = String(target).replace(/[^0-9]/g, '');
+  if (!cleanPhone) return { success: false, error: 'invalid_phone' };
+  if (cleanPhone.startsWith('0')) {
+    cleanPhone = '62' + cleanPhone.slice(1);
+  } else if (!cleanPhone.startsWith('62')) {
+    cleanPhone = '62' + cleanPhone;
+  }
+
+  const options = {
+    method: 'post',
+    headers: {
+      'Authorization': token
+    },
+    payload: {
+      'target': cleanPhone,
+      'message': message,
+      'countryCode': '62'
+    },
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch('https://api.fonnte.com/send', options);
+    return JSON.parse(response.getContentText());
+  } catch (err) {
+    return { success: false, error: String(err) };
   }
 }
 
@@ -179,8 +207,6 @@ function repairCanonicalSheet(sh) {
 
     if (!sourceKey && !recordId && !String(dataJson || '').trim()) return;
 
-    // Semua data_json yang dibuat aplikasi harus JSON valid.
-    // Baris seperti "data_json" adalah sisa header/korupsi lama dan dibuang.
     let parsedOk = false;
     try {
       JSON.parse(String(dataJson));
@@ -223,8 +249,6 @@ function migrateLegacySheet(sh) {
   const old = values.slice(1);
 
   old.forEach((row, i) => {
-    // Legacy sheet yang sudah memiliki kolom data_json tetapi header lain
-    // tetap dipertahankan sebagai payload JSON asli.
     if (dataJsonCol >= 0) {
       const raw = row[dataJsonCol];
       if (raw === null || raw === undefined || String(raw).trim() === '') return;
@@ -240,7 +264,6 @@ function migrateLegacySheet(sh) {
         ]);
         return;
       } catch (_) {
-        // Jika bukan JSON valid, jangan masukkan data rusak ke database.
         return;
       }
     }
@@ -393,18 +416,6 @@ function dedupeRowsInSheet(sh) {
   deleteRows.reverse().forEach(rowNum => sh.deleteRow(rowNum));
 }
 
-function findRowsByIdentity(sh, key, recordId) {
-  if (sh.getLastRow() <= 1) return [];
-  const values = sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues();
-  const out = [];
-  values.forEach((row, i) => {
-    const sourceKey = String(row[0] || '').trim();
-    const id = String(row[1] || '').trim();
-    if ((sourceKey === key && id === recordId) || id === recordId) out.push(i + 2);
-  });
-  return out;
-}
-
 function writeBatch(entries) {
   if (!Array.isArray(entries) || !entries.length) return [];
 
@@ -472,6 +483,7 @@ function writeBatch(entries) {
         return;
       }
 
+      // Gunakan logika upsert
       if (op === 'upsert' || op === 'append') {
         const lastRow = sh.getLastRow();
         const existing = new Map();
@@ -533,42 +545,4 @@ function uploadImageToDrive(base64str, filename) {
 function detectContentTypeFromBase64(value) {
   const m = String(value || '').match(/^data:([^;]+);base64,/);
   return m ? m[1] : null;
-}
-
-function notifySubscribers(payload) {
-  const raw = getScriptProp(PROP_SUBSCRIBERS);
-  if (!raw) return;
-  let urls = [];
-  try { urls = Array.isArray(JSON.parse(raw)) ? JSON.parse(raw) : [raw]; }
-  catch (_) { urls = [raw]; }
-  urls.filter(Boolean).forEach(url => {
-    try {
-      UrlFetchApp.fetch(String(url), {
-        method: 'post',
-        contentType: 'application/json',
-        payload: JSON.stringify(payload),
-        muteHttpExceptions: true
-      });
-    } catch (_) {}
-  });
-}
-
-function onChange(e) {
-  notifySubscribers({
-    event: 'sheet_changed',
-    details: { changeType: e && e.changeType || null }
-  });
-}
-
-function setSpreadsheetId(id) {
-  PropertiesService.getScriptProperties().setProperty(PROP_SPREADSHEET_ID, String(id || '').trim());
-}
-
-function setFolderId(id) {
-  PropertiesService.getScriptProperties().setProperty(PROP_FOLDER_ID, String(id || '').trim());
-}
-
-function setSubscribers(value) {
-  const normalized = typeof value === 'string' ? value : JSON.stringify(value || []);
-  PropertiesService.getScriptProperties().setProperty(PROP_SUBSCRIBERS, normalized);
 }

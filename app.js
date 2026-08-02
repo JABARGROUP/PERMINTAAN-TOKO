@@ -1059,34 +1059,26 @@ function kirimNotifikasiWA(targetPhone, message) {
     return false;
   }
 
-  let cleanPhone = String(targetPhone).replace(/[^0-9]/g, '');
-  if (!cleanPhone) return false;
-  if (cleanPhone.startsWith('0')) {
-    cleanPhone = '62' + cleanPhone.slice(1);
-  } else if (!cleanPhone.startsWith('62')) {
-    cleanPhone = '62' + cleanPhone;
-  }
+  // Menggunakan URL Apps Script Endpoint langsung dari memori / settingan global
+  const endpoint = (appStorage.getItem('STORE_ADMIN_SCRIPT_URL_V7_CLEAN') || window.APP_SHEETS_ENDPOINT || '').trim();
+  if (!endpoint) return false;
 
-  const formData = new FormData();
-  formData.append('target', cleanPhone);
-  formData.append('message', message);
-  formData.append('countryCode', '62');
-
-  fetch('https://api.fonnte.com/send', {
+  // Melempar perintah eksekusi ke Google Apps Script tanpa membaca balasan (no-cors)
+  fetch(endpoint.replace(/\/$/, ''), {
     method: 'POST',
-    headers: {
-      'Authorization': token
-    },
-    body: formData
-  }).then(res => res.json()).then(data => {
-    console.log('[FONTE WA API RESPONSE]:', data);
-  }).catch(err => {
-    console.error('[FONTE WA API ERROR]:', err);
-  });
+    mode: 'no-cors',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({
+      action: 'sendwa',
+      target: targetPhone,
+      message: message,
+      token: token
+    })
+  }).catch(err => console.error('[WA PROXY ERROR]:', err));
 
   return true;
 }
-
 // 10 THEME ENGINE
 function loadSavedTheme() {
   const saved = appStorage.getItem(THEME_KEY) || 'dark-mode';
@@ -3228,10 +3220,10 @@ function bukaBantuan() {
     popup.classList.add('show');
   }
 
-  // Activate 300ms Sub-second Fast Chat Sync
+  // PERBAIKAN: Activate 5000ms Polling Interval untuk mencegah 429 Too Many Requests
   pullCentralCloudDB();
   if (!fastChatInterval) {
-    fastChatInterval = setInterval(pullCentralCloudDB, 300);
+    fastChatInterval = setInterval(pullCentralCloudDB, 5000);
   }
 
   const chatList = document.getElementById('chatList');
@@ -3257,6 +3249,23 @@ function bukaBantuan() {
   }
 }
 
+function tutupBantuan() {
+  const popup = document.getElementById('popupBantuan');
+  const btnHelp = document.getElementById('helpButton');
+  if (popup) {
+    popup.style.display = 'none';
+    popup.classList.remove('show');
+  }
+  if (btnHelp && currentUser) {
+    btnHelp.style.display = 'flex';
+  }
+  // Reset interval agar tidak memakan koneksi di latar belakang
+  if (fastChatInterval) {
+    clearInterval(fastChatInterval);
+    fastChatInterval = null;
+  }
+  cekUnreadNotif();
+}
 function tutupBantuan() {
   const popup = document.getElementById('popupBantuan');
   const btnHelp = document.getElementById('helpButton');

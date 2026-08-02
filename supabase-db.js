@@ -1,17 +1,9 @@
 /* ======================================================
    GOOGLE SHEETS CLOUD DATABASE ENGINE
    Frontend -> Apps Script Proxy -> Google Sheets
-
-   IMPORTANT:
-   - Tidak menggunakan localStorage/sessionStorage untuk database.
-   - GET memakai JSONP agar GitHub Pages tidak terkena CORS.
-   - POST memakai text/plain + no-cors agar tidak memicu preflight.
-   - Setelah POST, data diverifikasi ulang lewat GET/JSONP.
-   - Server memakai LockService + record_id idempotent agar tidak duplikat.
 ====================================================== */
 
 const memoryCache = new Map();
-const DISABLE_PERSISTENCE = true;
 const sessionKey = window.SESSION_KEY || 'STORE_ACTIVE_SESSION_V7_CLEAN';
 const themeKey = window.THEME_KEY || 'STORE_ACTIVE_THEME_V7_CLEAN';
 const ADMIN_SCRIPT_URL_STORAGE_KEY = window.ADMIN_SCRIPT_URL_KEY || 'STORE_ADMIN_SCRIPT_URL_V7_CLEAN';
@@ -74,7 +66,6 @@ function parseStorageValue(value) {
 
 function normalizeDateFields(value) {
   if (value === null || value === undefined) return value;
-
   if (typeof value === 'string') {
     const str = value.trim();
     if (!str) return '';
@@ -84,9 +75,7 @@ function normalizeDateFields(value) {
     if (/^[0-9]+$/.test(str)) return str;
     return str;
   }
-
   if (Array.isArray(value)) return value.map(normalizeDateFields);
-
   if (typeof value === 'object') {
     const out = {};
     Object.entries(value).forEach(([key, val]) => {
@@ -95,7 +84,6 @@ function normalizeDateFields(value) {
     });
     return out;
   }
-
   return value;
 }
 
@@ -103,16 +91,6 @@ function serializeForCache(value) {
   if (value === null || value === undefined) return null;
   if (typeof value === 'string') return value;
   return JSON.stringify(normalizeDateFields(value));
-}
-
-function getRecordIdentity(item) {
-  if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
-  const keys = ['id', 'noSurat', 'username', 'roomId', 'messageId', 'key', 'code', 'record_id'];
-  for (const key of keys) {
-    const value = item[key];
-    if (value !== undefined && value !== null && String(value).trim() !== '') return String(value);
-  }
-  return null;
 }
 
 function setOnDataChangeCallback(fn) {
@@ -129,28 +107,21 @@ const appStorage = {
     const value = memoryCache.get(key);
     return typeof value === 'string' ? value : JSON.stringify(value);
   },
-
   setItem(key, value) {
     const normalized = normalizeDateFields(value);
     const serialized = serializeForCache(normalized);
     memoryCache.set(key, serialized);
-
-    // Saat aplikasi baru mulai, jangan kirim default lokal sebelum data Sheet selesai dimuat.
     if (isSupabaseReady && !cloudSyncBusy) {
       queueCloudWrite(key, parseStorageValue(serialized));
     }
   },
-
   removeItem(key) {
     memoryCache.delete(key);
     if (isSupabaseReady && !cloudSyncBusy) queueCloudDelete(key);
   },
-
   clear() {
     memoryCache.clear();
   },
-
-  // Dipakai untuk hydrate data dari server tanpa memicu write balik.
   hydrate: hydrateStorage
 };
 
@@ -162,7 +133,7 @@ function getCloudEndpoint() {
 
 async function loadSupabaseConfigFromJson() {
   try {
-    const resp = await fetch('./sheets-config.json?v=20260802-proxy-v3', { cache: 'no-store' });
+    const resp = await fetch('./sheets-config.json?v=20260802-proxy-v4', { cache: 'no-store' });
     if (!resp.ok) throw new Error('CONFIG_HTTP_' + resp.status);
     const cfg = await resp.json();
     if (cfg && cfg.SHEETS_ENDPOINT) window.APP_SHEETS_ENDPOINT = String(cfg.SHEETS_ENDPOINT).trim();
@@ -196,8 +167,6 @@ function jsonpGet(url, timeoutMs = 60000) {
     const timer = setTimeout(() => {
       if (finished) return;
       finished = true;
-      // Apps Script can be slow on the first request. Keep the callback briefly
-      // so a late JSONP response does not become "callback is not defined".
       reject(new Error('JSONP timeout'));
       setTimeout(() => {
         try { delete window[callbackName]; } catch (_) { window[callbackName] = undefined; }
@@ -273,7 +242,7 @@ function queueCloudWrite(key, value) {
   pendingWrites.set(storageKey, {
     key: storageKey,
     sheet,
-    op: 'replace',
+    op: 'upsert', // DARI 'replace' MENJADI 'upsert' UNTUK MENGHINDARI DUPLIKASI DAN PENGHAPUSAN DATA LAIN
     value: SCALAR_KEYS.has(storageKey) ? value : (Array.isArray(value) ? value : [value])
   });
 
@@ -301,8 +270,6 @@ async function postNoCors(payload) {
   const endpoint = getCloudEndpoint();
   if (!endpoint) throw new Error('Endpoint kosong');
 
-  // text/plain adalah simple request sehingga browser tidak melakukan OPTIONS preflight.
-  // mode no-cors berarti response POST tidak dibaca; keberhasilan diverifikasi via JSONP GET.
   await fetch(endpoint.replace(/\/$/, ''), {
     method: 'POST',
     mode: 'no-cors',
@@ -312,7 +279,6 @@ async function postNoCors(payload) {
     keepalive: true
   });
 }
-
 
 function stableCloudValue(value) {
   if (value === undefined) return '__UNDEFINED__';
@@ -334,28 +300,22 @@ function sameCloudValue(a, b) {
 
 function verifyWriteSnapshot(snapshot) {
   const failures = [];
-
   (snapshot || []).forEach(entry => {
     const key = String(entry && entry.key || '').trim();
     if (!key) return;
-
     const actualRaw = appStorage.getItem(key);
     const actual = actualRaw === null ? null : parseStorageValue(actualRaw);
-
     if (String(entry.op || '').toLowerCase() === 'delete') {
       if (actualRaw !== null) failures.push(key + ':delete');
       return;
     }
-
     const expected = SCALAR_KEYS.has(key)
       ? entry.value
       : (Array.isArray(entry.value) ? entry.value : [entry.value]);
-
     if (!sameCloudValue(actual, expected)) {
       failures.push(key + ':verify');
     }
   });
-
   if (failures.length) {
     throw new Error('WRITE TIDAK TERVERIFIKASI: ' + failures.join(', '));
   }
@@ -372,11 +332,10 @@ async function flushPendingWrites() {
     console.log('📤 Mengirim batch ke Google Sheets:', snapshot.length);
     await postNoCors({ action: 'write', data: snapshot });
 
-    // Apps Script dapat membutuhkan sedikit waktu untuk commit.
-    await new Promise(resolve => setTimeout(resolve, 900));
+    // WAKTU COMMIT DINAIKKAN MENJADI 2500ms (2.5 Detik) AGAR GOOGLE SHEETS PUNYA WAKTU UPDATE
+    await new Promise(resolve => setTimeout(resolve, 2500));
     await loadAllFromSupabase();
 
-    // GET berhasil saja belum membuktikan data benar-benar tersimpan.
     verifyWriteSnapshot(snapshot);
 
     isSupabaseOnline = true;
@@ -407,7 +366,6 @@ async function pushToSupabaseNow() {
 
 async function pullFromSupabase() {
   if (lastPushAt && Date.now() - lastPushAt < PUSH_SUPPRESS_MS) return true;
-
   try {
     await loadAllFromSupabase();
     isSupabaseOnline = true;
@@ -428,7 +386,6 @@ async function initSupabaseDB() {
     console.warn('❌ SHEETS_ENDPOINT belum tersedia.');
     return false;
   }
-
   try {
     await loadAllFromSupabase();
     isSupabaseReady = true;
@@ -447,35 +404,24 @@ async function initSupabaseDB() {
 
 async function seedSupabaseDefaults(defaults) {
   if (!isSupabaseReady) return;
-
   Object.entries(defaults || {}).forEach(([key, value]) => {
     const rowCount = cloudRowCounts.get(key);
     const parsedDefault = parseStorageValue(value);
     const defaultIsEmpty = Array.isArray(parsedDefault) ? parsedDefault.length === 0 :
       (parsedDefault && typeof parsedDefault === 'object' ? Object.keys(parsedDefault).length === 0 : String(parsedDefault ?? '') === '');
-
-    // Sheet kosong dianggap belum terinisialisasi hanya jika default memang berisi data.
     if (cloudLoadedKeys.has(key) && (rowCount > 0 || defaultIsEmpty)) return;
     if (!memoryCache.has(key)) hydrateStorage(key, value);
     queueCloudWrite(key, parseStorageValue(appStorage.getItem(key)) ?? parsedDefault);
   });
-
   await pushToSupabaseNow();
 }
 
 function startSupabaseKeepalive() {
-  // Satu interval saja. Tidak ada POST otomatis berulang.
   if (window.__sheetsKeepaliveStarted) return;
   window.__sheetsKeepaliveStarted = true;
   setInterval(() => {
     if (!cloudSyncBusy && pendingWrites.size === 0) pullFromSupabase().catch(() => {});
   }, 15000);
-}
-
-async function uploadPhotoToSupabaseStorage(file, fileName) {
-  // Foto tetap nonaktif sesuai konfigurasi aplikasi saat ini.
-  console.warn('⚠️ Upload foto dinonaktifkan.');
-  return null;
 }
 
 function updateSupabaseStatusUI(isOnline) {
@@ -495,14 +441,12 @@ function updateSupabaseStatusUI(isOnline) {
   }
 }
 
-// Public API untuk app.js.
 window.initSupabaseDB = initSupabaseDB;
 window.loadSupabaseConfigFromJson = loadSupabaseConfigFromJson;
 window.pushToSupabaseNow = pushToSupabaseNow;
 window.pullFromSupabase = pullFromSupabase;
 window.startSupabaseKeepalive = startSupabaseKeepalive;
 window.seedSupabaseDefaults = seedSupabaseDefaults;
-window.uploadPhotoToSupabaseStorage = uploadPhotoToSupabaseStorage;
 window.queueCloudWrite = queueCloudWrite;
 window.queueCloudDelete = queueCloudDelete;
 window.hasPendingCloudWrites = () => pendingWrites.size > 0 || cloudSyncBusy;

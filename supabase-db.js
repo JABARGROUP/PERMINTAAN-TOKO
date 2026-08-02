@@ -6,6 +6,8 @@
 ====================================================== */
 
 const memoryCache = new Map();
+// When true, do not persist any cache to sessionStorage/localStorage
+const DISABLE_PERSISTENCE = true;
 const sessionKey = window.SESSION_KEY || 'STORE_ACTIVE_SESSION_V7_CLEAN';
 const themeKey = window.THEME_KEY || 'STORE_ACTIVE_THEME_V7_CLEAN';
 const ADMIN_SCRIPT_URL_STORAGE_KEY = window.ADMIN_SCRIPT_URL_KEY || 'STORE_ADMIN_SCRIPT_URL_V7_CLEAN';
@@ -15,14 +17,19 @@ let writeTimer = null;
 let isSupabaseReady = false; // kept for compatibility with app.js
 let isSupabaseOnline = false;
 let onDataChangeCallback = null;
+// Timestamp of last successful push; used to suppress immediate pulls
+let lastPushAt = 0;
+const PUSH_SUPPRESS_MS = 3000; // suppress pulls for 3 seconds after push
 
 const appStorage = {
   getItem(key) {
     try {
-      const localValue = window.localStorage ? window.localStorage.getItem(key) : null;
-      if (localValue !== null) {
-        memoryCache.set(key, localValue);
-        return localValue;
+      if (!DISABLE_PERSISTENCE) {
+        const storedValue = window.sessionStorage ? window.sessionStorage.getItem(key) : null;
+        if (storedValue !== null) {
+          memoryCache.set(key, storedValue);
+          return storedValue;
+        }
       }
     } catch (err) {
       // fallback to memory cache
@@ -38,12 +45,12 @@ const appStorage = {
     const strVal = typeof normalizedValue === 'string' ? normalizedValue : JSON.stringify(normalizedValue);
     memoryCache.set(key, strVal);
     try {
-      // Persist to localStorage ONLY for session (user login/password)
-      if (window.localStorage && key === sessionKey) {
-        window.localStorage.setItem(key, strVal);
+      // Persist session to sessionStorage only if persistence enabled
+      if (!DISABLE_PERSISTENCE && window.sessionStorage && key === sessionKey) {
+        window.sessionStorage.setItem(key, strVal);
       }
     } catch (err) {
-      console.warn('localStorage write failed:', err.message);
+      console.warn('storage write failed:', err.message);
     }
     schedulePersist(key, parseStorageValue(strVal));
   },
@@ -51,8 +58,8 @@ const appStorage = {
   removeItem(key) {
     memoryCache.delete(key);
     try {
-      if (window.localStorage && key === sessionKey) {
-        window.localStorage.removeItem(key);
+      if (!DISABLE_PERSISTENCE && window.sessionStorage && key === sessionKey) {
+        window.sessionStorage.removeItem(key);
       }
     } catch (err) {
       console.warn('localStorage remove failed:', err.message);
@@ -68,9 +75,9 @@ const appStorage = {
     });
 
     try {
-      if (window.localStorage) {
-        Object.keys(window.localStorage).forEach(k => {
-          if (!keepKeys.has(k)) window.localStorage.removeItem(k);
+      if (!DISABLE_PERSISTENCE && window.sessionStorage) {
+        Object.keys(window.sessionStorage).forEach(k => {
+          if (!keepKeys.has(k)) window.sessionStorage.removeItem(k);
         });
       }
     } catch (err) {
@@ -89,13 +96,20 @@ function normalizeDateFields(value) {
   if (typeof value === 'string') {
     const str = value.trim();
     if (!str) return '';
+
+    // If already in dd/mm/yyyy format, keep as-is (strip time if present)
     if (/^\d{2}\/\d{2}\/\d{4}/.test(str)) return str.split(' ')[0];
 
+    // yyyy-mm-dd or yyyy/mm/dd -> convert to dd/mm/yyyy
     const match = str.match(/^(\d{4})[-/](\d{2})[-/](\d{2})/);
     if (match) {
       return `${match[3]}/${match[2]}/${match[1]}`;
     }
 
+    // Avoid converting pure-numeric strings (IDs, numbers) into dates
+    if (/^[0-9]+$/.test(str)) return str;
+
+    // If string contains non-numeric characters, try parsing as a date
     const d = new Date(str);
     if (!isNaN(d.getTime())) {
       const day = String(d.getDate()).padStart(2, '0');
@@ -116,7 +130,16 @@ function normalizeDateFields(value) {
     Object.entries(value).forEach(([k, v]) => {
       const key = String(k || '').toLowerCase();
       const shouldNormalize = /(tanggal|createdat|updatedat|updated_at|created_at|date)/i.test(key);
-      out[k] = shouldNormalize ? normalizeDateFields(v) : normalizeDateFields(v);
+      if (shouldNormalize) {
+        out[k] = normalizeDateFields(v);
+      } else {
+        // For non-date keys, recurse but avoid forcing string->date conversions
+        if (typeof v === 'object' && v !== null) {
+          out[k] = normalizeDateFields(v);
+        } else {
+          out[k] = v;
+        }
+      }
     });
     return out;
   }
@@ -292,7 +315,96 @@ async function loadAllFromSupabase() {
 
 }
 function schedulePersist(key, parsedValue) {
-  pendingWrites.set(key, normalizeDateFields(parsedValue));
+  const normalized = normalizeDateFields(parsedValue);
+
+  // Helper to update memoryCache stored string
+  function setCache(k, v) {
+    memoryCache.set(k, serializeForCache(v));
+  }
+
+  try {
+    // If value is an array, try to append only new rows instead of replacing
+    if (Array.isArray(normalized)) {
+      const cachedStr = memoryCache.get(key);
+      const cached = cachedStr ? parseStorageValue(cachedStr) : [];
+
+      if (!Array.isArray(cached) || cached.length === 0) {
+        if (!normalized || normalized.length === 0) return; // nothing to do
+        // No cache — set full array and append all rows
+        setCache(key, normalized);
+        pendingWrites.set(key, { __OP__: 'append', items: normalized });
+      } else {
+        // Try object-based diff (by `id` field)
+        const first = normalized[0];
+        const isObjects = typeof first === 'object' && first !== null;
+        if (isObjects) {
+          const cachedMap = new Map();
+          cached.forEach(it => { if (it && (it.id || it.id === 0)) cachedMap.set(String(it.id), it); });
+
+          const newItems = [];
+          const updatedItems = [];
+
+          normalized.forEach(it => {
+            const id = it && (it.id || it.id === 0) ? String(it.id) : null;
+            if (!id) return;
+            const existing = cachedMap.get(id);
+            if (!existing) newItems.push(it);
+            else if (JSON.stringify(existing) !== JSON.stringify(it)) updatedItems.push(it);
+          });
+
+          if (newItems.length === 0 && updatedItems.length === 0) {
+            return; // no changes
+          }
+
+          // merge into cached representation
+          const merged = [...cached];
+          const idxById = new Map();
+          merged.forEach((it, idx) => { if (it && (it.id || it.id === 0)) idxById.set(String(it.id), idx); });
+          newItems.forEach(it => merged.push(it));
+          updatedItems.forEach(it => {
+            const id = String(it.id);
+            if (idxById.has(id)) merged[idxById.get(id)] = it;
+            else merged.push(it);
+          });
+
+          setCache(key, merged);
+
+          // schedule append and/or upsert
+          if (newItems.length && updatedItems.length) {
+            pendingWrites.set(key, { __OPS__: [ { op: 'append', items: newItems }, { op: 'upsert', items: updatedItems } ] });
+          } else if (newItems.length) {
+            pendingWrites.set(key, { __OP__: 'append', items: newItems });
+          } else {
+            pendingWrites.set(key, { __OP__: 'upsert', items: updatedItems });
+          }
+        } else {
+          // primitive arrays: append tail if length increased
+          if (normalized.length > cached.length) {
+            const tail = normalized.slice(cached.length);
+            setCache(key, [...cached, ...tail]);
+            pendingWrites.set(key, { __OP__: 'append', items: tail });
+          } else if (JSON.stringify(normalized) !== JSON.stringify(cached)) {
+            // fallback: replace whole array
+            setCache(key, normalized);
+            pendingWrites.set(key, normalized);
+          } else {
+            return; // identical
+          }
+        }
+      }
+    } else {
+      // Non-array values: write only if changed
+      const cachedStr = memoryCache.get(key);
+      const cached = cachedStr ? parseStorageValue(cachedStr) : cachedStr;
+      if (JSON.stringify(cached) === JSON.stringify(normalized)) return;
+      setCache(key, normalized);
+      pendingWrites.set(key, normalized);
+    }
+  } catch (err) {
+    // On error fall back to simple persist
+    pendingWrites.set(key, normalized);
+  }
+
   if (writeTimer) clearTimeout(writeTimer);
   writeTimer = setTimeout(flushPendingWrites, 300);
 }
@@ -312,14 +424,35 @@ async function flushPendingWrites() {
     const batch = [];
 
     for (const [key, value] of pendingWrites.entries()) {
+      const sheet = mapStorageKeyToSheetName(key);
+      if (!value) continue;
 
-        batch.push({
-            key: key,
-            sheet: mapStorageKeyToSheetName(key),
-            op: value && value.__DELETE__ ? "delete" : "upsert",
-            value: value && value.__DELETE__ ? undefined : value
+      if (value && value.__DELETE__) {
+        batch.push({ key, sheet, op: 'delete' });
+        continue;
+      }
+
+      if (value && value.__OPS__ && Array.isArray(value.__OPS__)) {
+        value.__OPS__.forEach(opItem => {
+          const opName = opItem.op || 'upsert';
+          batch.push({ key, sheet, op: opName, value: opItem.items });
         });
+        continue;
+      }
 
+      if (value && value.__OP__) {
+        const opName = value.__OP__;
+        batch.push({ key, sheet, op: opName, value: value.items });
+        continue;
+      }
+
+      if (Array.isArray(value)) {
+        batch.push({ key, sheet, op: 'replace', value });
+        continue;
+      }
+
+      // default: upsert single object/value
+      batch.push({ key, sheet, op: 'upsert', value });
     }
 
     pendingWrites.clear();
@@ -356,8 +489,10 @@ async function flushPendingWrites() {
             throw new Error(result.error);
         }
 
-        isSupabaseOnline = true;
-        updateSupabaseStatusUI(true);
+          isSupabaseOnline = true;
+          updateSupabaseStatusUI(true);
+          // record last successful push time to avoid immediate pull overwrite
+          try { lastPushAt = Date.now(); } catch (e) {}
 
     } catch (err) {
 
@@ -375,6 +510,13 @@ async function pushToSupabaseNow() {
 }
 
 async function pullFromSupabase() {
+  // if we just pushed, skip immediate pull to avoid overwriting local new data
+  try {
+    if (lastPushAt && (Date.now() - lastPushAt) < PUSH_SUPPRESS_MS) {
+      console.log('pullFromSupabase: skipped due to recent push');
+      return true;
+    }
+  } catch (e) {}
   try {
     await loadAllFromSupabase();
     isSupabaseOnline = true;

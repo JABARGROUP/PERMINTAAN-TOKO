@@ -170,15 +170,56 @@ function writeBatch(entries) {
       } else {
         const now = ent.updated_at || new Date().toISOString();
         const values = Array.isArray(ent.value) ? ent.value : [ent.value];
+
+        // Ensure header exists
+        if (sh.getLastRow() === 0) {
+          sh.appendRow(['source_key', 'record_id', 'data_json', 'updated_at']);
+        }
+
+        // Read existing record_ids once to avoid repeated calls
+        const lastRow = sh.getLastRow();
+        let existingRecordIds = lastRow > 1 ? sh.getRange(2, 2, lastRow - 1, 1).getValues().map(r => String(r[0] || '')) : [];
+
+        // If replace operation, clear existing data rows first
+        if (op === 'replace' && lastRow > 1) {
+          sh.getRange(2, 1, lastRow - 1, 4).clearContent();
+          existingRecordIds = [];
+        }
+
         values.forEach(item => {
           if (item && typeof item === 'object' && !Array.isArray(item)) {
             const recordId = String(item.id || item.noSurat || item.username || item.roomId || item.messageId || `${Date.now()}-${Math.random() * 1000}`);
-            sh.appendRow([key, recordId, JSON.stringify(item), now]);
+            const idx = existingRecordIds.indexOf(recordId);
+
+            if (op === 'replace') {
+              // for replace we will append later after clearing; handle outside
+              sh.appendRow([key, recordId, JSON.stringify(item), now]);
+            } else if (op === 'upsert') {
+              if (idx !== -1) {
+                // update existing row
+                const rowNum = 2 + idx;
+                sh.getRange(rowNum, 3).setValue(JSON.stringify(item));
+                sh.getRange(rowNum, 4).setValue(now);
+              } else {
+                sh.appendRow([key, recordId, JSON.stringify(item), now]);
+                existingRecordIds.push(recordId);
+              }
+            } else if (op === 'append') {
+              // only append if not present
+              if (idx === -1) {
+                sh.appendRow([key, recordId, JSON.stringify(item), now]);
+                existingRecordIds.push(recordId);
+              }
+            } else {
+              // default fallback: append
+              sh.appendRow([key, recordId, JSON.stringify(item), now]);
+            }
           } else {
             sh.appendRow([key, '', JSON.stringify(item), now]);
           }
         });
-        result.push({ key, ok: true, op: 'upsert' });
+
+        result.push({ key, ok: true, op: op });
       }
     } catch (err) {
       result.push({ key: ent.key || null, ok: false, reason: String(err) });

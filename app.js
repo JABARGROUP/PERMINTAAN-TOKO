@@ -434,9 +434,11 @@ function formatDateDDMMYYYYString(input) {
 document.addEventListener('DOMContentLoaded', async () => {
   initDatabase();
   if (typeof loadSupabaseConfigFromJson === 'function') {
-    await loadSupabaseConfigFromJson();
+    // load config but don't block the UI
+    loadSupabaseConfigFromJson().catch(() => {});
   }
-  await initSupabaseDB();
+  // Initialize cloud in background to avoid blocking UI responsiveness
+  initSupabaseDB().catch(() => {});
   startCentralCloudSyncEngine();
   startSupabaseKeepalive();
   loadSavedTheme();
@@ -1161,9 +1163,10 @@ async function prosesLogin() {
   const uEl = document.getElementById('username');
   const pEl = document.getElementById('password');
   if (!uEl || !pEl) return;
-
-  const u = uEl.value.trim().toUpperCase();
-  const p = pEl.value.trim();
+  showLoading('MEMPROSES LOGIN...');
+  try {
+    const u = uEl.value.trim().toUpperCase();
+    const p = pEl.value.trim();
   const adminSecretKey = ((document.getElementById('adminSecretKey')?.value || '').trim() || getSavedAdminSecretKey());
 
   if (!u || !p) {
@@ -1208,12 +1211,15 @@ async function prosesLogin() {
     saveUsersToDB(users);
   }
 
-  if (user) {
-    currentUser = user;
-    appStorage.setItem(SESSION_KEY, JSON.stringify(user));
-    bukaMainApp();
-  } else {
-    showNotif('USERNAME ATAU PASSWORD SALAH!', 'error');
+    if (user) {
+      currentUser = user;
+      appStorage.setItem(SESSION_KEY, JSON.stringify(user));
+      bukaMainApp();
+    } else {
+      showNotif('USERNAME ATAU PASSWORD SALAH!', 'error');
+    }
+  } finally {
+    hideLoading();
   }
 }
 window.prosesLogin = prosesLogin;

@@ -1,304 +1,420 @@
 /*
-  Google Apps Script Web App for syncing app data to Google Sheets and uploading images to Google Drive.
-  - Deploy as Web App (Execute as: Me, Who has access: Anyone)
-  - Configure SCRIPT_PROPERTIES: FOLDER_ID (Drive folder), SUBSCRIBERS (JSON array of webhook URLs)
-  - Supports:
-    GET  ?action=loadAll               => returns all sheets data as [{sheet, rows:[{key,value,updated_at}]}]
-    GET  ?action=loadSheet&sheet=name => returns sheet rows
-    POST { action:'write', data:[{sheet, key, op:'upsert'|'delete', value, updated_at}] }
-    POST { action:'uploadImage', filename, imageBase64 } => stores image to configured folder, returns public link
+ * PERMINTAAN TOKO - GOOGLE SHEETS PROXY
+ *
+ * Database tunggal: Google Sheets.
+ * Frontend GitHub Pages TIDAK berbicara langsung ke Spreadsheet API.
+ * Semua akses melewati Web App Apps Script ini.
+ *
+ * GET  : JSONP untuk membaca data tanpa masalah CORS.
+ * POST : text/plain + no-cors dari browser untuk menulis data.
+ *       Setelah POST, frontend melakukan verifikasi GET/JSONP.
+ *
+ * Deploy Web App:
+ *   Execute as: Me
+ *   Who has access: Anyone
+ */
 
-  Notes:
-  - Sheet structure: each sheet (e.g., "chat", "requests") should have columns: source_key | record_id | data_json | updated_at (A-D)
-  - For images, set folder sharing to "Anyone with link" after first upload or script will set sharing automatically.
-  - onChange/e triggers can call notifySubscribers to push changes to configured webhook URLs.
-*/
-
+const PROP_SPREADSHEET_ID = 'SPREADSHEET_ID';
 const PROP_FOLDER_ID = 'FOLDER_ID';
 const PROP_SUBSCRIBERS = 'SUBSCRIBERS';
 const DEFAULT_SPREADSHEET_ID = '1PryP6ZpGyNEcFRyaRx-93wLn2lJ5qq5mMUj4jyxs3fc';
+const HEADER = ['source_key', 'record_id', 'data_json', 'updated_at'];
 
-function buildJsonResponse(obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj))
+const SHEET_MAP = {
+  STORE_USERS_DB_V7_CLEAN: 'users',
+  STORE_REQUESTS_DB_V7_CLEAN: 'requests',
+  STORE_CHAT_DB_V7_CLEAN: 'chat',
+  STORE_CHAT_ROOM_DB_V7_CLEAN: 'chat_rooms',
+  STORE_TTD_DB_V7_CLEAN: 'ttd',
+  STORE_CUSTOM_TOKO_LIST_V7_CLEAN: 'stores',
+  STORE_DELETED_TOKO_LIST_V7_CLEAN: 'deleted_stores',
+  STORE_SYSTEM_NOTIFICATIONS_V7_CLEAN: 'notifications',
+  STORE_KODE_UNIT_MAP_V7_CLEAN: 'kode_unit_map',
+  STORE_FEATURE_PHOTOS_V7_CLEAN: 'feature_photos',
+  STORE_DELETED_REQUESTS_V7_CLEAN: 'deleted_requests',
+  STORE_DELETED_USERS_V7_CLEAN: 'deleted_users',
+  STORE_FONTE_TOKEN_KEY_V7_CLEAN: 'fonte_token',
+  STORE_ADMIN_REMINDER_KEY_V7_CLEAN: 'admin_reminder',
+  STORE_ADMIN_SECRET_KEY_V7_CLEAN: 'admin_secret',
+  STORE_ACTIVE_SESSION_V7_CLEAN: 'sessions',
+  STORE_ACTIVE_THEME_V7_CLEAN: 'theme',
+  STORE_ADMIN_SCRIPT_URL_V7_CLEAN: 'admin_script_url'
+};
+
+const REVERSE_SHEET_MAP = Object.keys(SHEET_MAP).reduce((acc, key) => {
+  acc[SHEET_MAP[key]] = key;
+  return acc;
+}, {});
+
+function getScriptProp(key) {
+  return PropertiesService.getScriptProperties().getProperty(key) || '';
+}
+
+function getSpreadsheet() {
+  const configuredId = String(getScriptProp(PROP_SPREADSHEET_ID) || DEFAULT_SPREADSHEET_ID).trim();
+  if (configuredId) return SpreadsheetApp.openById(configuredId);
+
+  const active = SpreadsheetApp.getActiveSpreadsheet();
+  if (active) return active;
+
+  throw new Error('SPREADSHEET_ID belum dikonfigurasi di Script Properties.');
+}
+
+function jsonText(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-function doOptions(e) {
-  return ContentService.createTextOutput('');
+function jsonpText(callback, obj) {
+  const safe = String(callback || '').replace(/[^A-Za-z0-9_.$]/g, '');
+  if (!safe) return jsonText(obj);
+  return ContentService
+    .createTextOutput(safe + '(' + JSON.stringify(obj) + ');')
+    .setMimeType(ContentService.MimeType.JAVASCRIPT);
 }
 
 function doGet(e) {
-  const action = (e.parameter && e.parameter.action || '').toString().toLowerCase().trim();
+  const p = (e && e.parameter) || {};
+  const action = String(p.action || '').trim().toLowerCase();
+  const callback = p.callback || p.cb || '';
+
   try {
-    if (action === 'loadall') {
-      const data = loadAllSheets();
-      return buildJsonResponse({ success: true, data });
+    let payload;
+
+    if (action === 'ping') {
+      payload = {
+        success: true,
+        ok: true,
+        service: 'PERMINTAAN TOKO GOOGLE SHEETS PROXY',
+        time: new Date().toISOString()
+      };
+    } else if (action === 'loadall') {
+      cleanupDuplicateRowsOnce();
+      payload = { success: true, ok: true, data: loadAllSheets() };
+    } else if (action === 'loadsheet') {
+      const sheet = String(p.sheet || '').trim();
+      if (!sheet) throw new Error('sheet wajib diisi');
+      payload = { success: true, ok: true, sheet: sheet, rows: loadSheetRows(sheet) };
+    } else {
+      payload = { success: false, ok: false, error: 'invalid_action', action: action };
     }
 
-    if (action === 'loadsheet' && e.parameter && e.parameter.sheet) {
-      const rows = loadSheetRows(e.parameter.sheet);
-      return buildJsonResponse({ success: true, sheet: e.parameter.sheet, rows });
-    }
-
-    return buildJsonResponse({ error: 'invalid_action_or_missing_params', action: action, params: e.parameter });
+    return callback ? jsonpText(callback, payload) : jsonText(payload);
   } catch (err) {
-    return buildJsonResponse({ error: String(err), errorType: 'GET_ERROR' });
+    const payload = { success: false, ok: false, error: String(err), errorType: 'GET_ERROR' };
+    return callback ? jsonpText(callback, payload) : jsonText(payload);
   }
 }
 
 function doPost(e) {
   let body = {};
-  let contentType = 'text/plain';
-  
   try {
-    if (e && e.postData && e.postData.contents) {
-      contentType = e.postData.type || 'text/plain';
-      const raw = String(e.postData.contents || '').trim();
-      if (raw) {
-        try {
-          body = JSON.parse(raw);
-        } catch (jsonErr) {
-          body = e.parameter || {};
-        }
-      } else {
-        body = e.parameter || {};
-      }
-    } else {
-      body = e.parameter || {};
+    const raw = e && e.postData && e.postData.contents ? e.postData.contents : '';
+    if (raw) {
+      body = JSON.parse(raw);
+    } else if (e && e.parameter) {
+      body = e.parameter;
+      if (typeof body.data === 'string') body.data = JSON.parse(body.data);
     }
   } catch (err) {
-    return buildJsonResponse({ error: 'invalid_json', details: String(err) });
+    return jsonText({ success: false, ok: false, error: 'invalid_json', details: String(err) });
   }
 
-  const action = (body.action || '').toString().toLowerCase().trim();
+  const action = String(body.action || '').trim().toLowerCase();
+
   try {
     if (action === 'write' && Array.isArray(body.data)) {
       const result = writeBatch(body.data);
-      return buildJsonResponse({ success: true, ok: true, written: result });
+      return jsonText({ success: true, ok: true, written: result });
     }
 
     if (action === 'uploadimage' && body.imageBase64 && body.filename) {
-      const link = uploadImageToDrive(body.imageBase64, body.filename);
-      return buildJsonResponse({ success: true, ok: true, url: link });
+      const url = uploadImageToDrive(body.imageBase64, body.filename);
+      return jsonText({ success: true, ok: true, url: url });
     }
 
-    return buildJsonResponse({ error: 'invalid_action_or_missing_params', action: action, received: body });
+    return jsonText({ success: false, ok: false, error: 'invalid_action', action: action });
   } catch (err) {
-    return buildJsonResponse({ error: String(err), errorType: 'POST_ERROR', action: action });
-  }
-}
-
-function getScriptProp(key) {
-  return PropertiesService.getScriptProperties().getProperty(key) || null;
-}
-
-function getSpreadsheet() {
-  try {
-    const spreadsheetId = (getScriptProp('SPREADSHEET_ID') || DEFAULT_SPREADSHEET_ID).trim();
-    if (spreadsheetId) {
-      return SpreadsheetApp.openById(spreadsheetId);
-    }
-  } catch (err) {
-    // fallback to active spreadsheet
-  }
-
-  try {
-    return SpreadsheetApp.getActiveSpreadsheet();
-  } catch (err) {
-    throw new Error('Tidak bisa membuka spreadsheet. Pastikan Apps Script terhubung ke Google Sheet yang benar.');
+    return jsonText({ success: false, ok: false, error: String(err), errorType: 'POST_ERROR', action: action });
   }
 }
 
 function ensureSheetHeader(sh) {
+  if (sh.getMaxColumns() < 4) {
+    sh.insertColumnsAfter(sh.getMaxColumns(), 4 - sh.getMaxColumns());
+  }
+
   if (sh.getLastRow() === 0) {
-    sh.appendRow(['source_key', 'record_id', 'data_json', 'updated_at']);
+    sh.getRange(1, 1, 1, 4).setValues([HEADER]);
     return;
   }
 
-  const firstRow = sh.getRange(1, 1, 1, 4).getValues()[0] || [];
-  if (!String(firstRow[0] || '').trim()) {
-    sh.getRange(1, 1, 1, 4).setValues([['source_key', 'record_id', 'data_json', 'updated_at']]);
+  const first = sh.getRange(1, 1, 1, 4).getValues()[0];
+  const valid = String(first[0] || '').trim() === 'source_key' &&
+                String(first[1] || '').trim() === 'record_id' &&
+                String(first[2] || '').trim() === 'data_json' &&
+                String(first[3] || '').trim() === 'updated_at';
+
+  if (!valid) {
+    // Existing legacy data: preserve it by moving it into data_json rows.
+    migrateLegacySheet(sh);
   }
 }
 
-function findExistingRowNumber(sh, key, recordId) {
-  const lastRow = sh.getLastRow();
-  if (lastRow <= 1) return null;
-
-  const values = sh.getRange(2, 1, lastRow - 1, 2).getValues();
-  for (let i = 0; i < values.length; i++) {
-    const rowKey = String(values[i][0] || '').trim();
-    const existingRecordId = String(values[i][1] || '').trim();
-    if (rowKey === key && existingRecordId === recordId) return i + 2;
+function migrateLegacySheet(sh) {
+  const values = sh.getDataRange().getValues();
+  if (!values.length) {
+    sh.clear();
+    sh.getRange(1, 1, 1, 4).setValues([HEADER]);
+    return;
   }
 
-  for (let i = 0; i < values.length; i++) {
-    const existingRecordId = String(values[i][1] || '').trim();
-    if (existingRecordId && existingRecordId === recordId) return i + 2;
-  }
-
-  return null;
-}
-
-function dedupeSheetRows(sh, key) {
-  const lastRow = sh.getLastRow();
-  if (lastRow <= 2) return;
-
-  const values = sh.getRange(2, 1, lastRow - 1, 4).getValues();
-  const seen = new Set();
-  const rowsToDelete = [];
-
-  values.forEach((row, index) => {
-    const rowKey = String(row[0] || '').trim();
-    const recordId = String(row[1] || '').trim();
-    if (!recordId) return;
-
-    const fingerprint = `${rowKey}::${recordId}`;
-    if (seen.has(fingerprint)) {
-      rowsToDelete.push(index + 2);
-    } else {
-      seen.add(fingerprint);
-    }
+  const old = values.slice(1);
+  const converted = [];
+  old.forEach((row, i) => {
+    const joined = row.map(v => v === null || v === undefined ? '' : String(v)).join(' | ').trim();
+    if (!joined) return;
+    converted.push(['legacy', 'legacy-' + (i + 1), JSON.stringify(row), new Date().toISOString()]);
   });
 
-  rowsToDelete.reverse().forEach(rowNum => sh.deleteRow(rowNum));
+  sh.clear();
+  sh.getRange(1, 1, 1, 4).setValues([HEADER]);
+  if (converted.length) sh.getRange(2, 1, converted.length, 4).setValues(converted);
 }
 
-function inferSheetName(key) {
-  const map = {
-    STORE_USERS_DB_V7_CLEAN: 'users',
-    STORE_REQUESTS_DB_V7_CLEAN: 'requests',
-    STORE_CHAT_DB_V7_CLEAN: 'chat',
-    STORE_CHAT_ROOM_DB_V7_CLEAN: 'chat_rooms',
-    STORE_TTD_DB_V7_CLEAN: 'ttd',
-    STORE_CUSTOM_TOKO_LIST_V7_CLEAN: 'stores',
-    STORE_DELETED_TOKO_LIST_V7_CLEAN: 'deleted_stores',
-    STORE_SYSTEM_NOTIFICATIONS_V7_CLEAN: 'notifications',
-    STORE_KODE_UNIT_MAP_V7_CLEAN: 'kode_unit_map',
-    STORE_FEATURE_PHOTOS_V7_CLEAN: 'feature_photos',
-    STORE_DELETED_REQUESTS_V7_CLEAN: 'deleted_requests',
-    STORE_DELETED_USERS_V7_CLEAN: 'deleted_users',
-    STORE_FONTE_TOKEN_KEY_V7_CLEAN: 'fonte_token',
-    STORE_ADMIN_REMINDER_KEY_V7_CLEAN: 'admin_reminder',
-    STORE_ADMIN_SECRET_KEY_V7_CLEAN: 'admin_secret',
-    STORE_ACTIVE_SESSION_V7_CLEAN: 'sessions',
-    STORE_ACTIVE_THEME_V7_CLEAN: 'theme',
-    STORE_ADMIN_SCRIPT_URL_V7_CLEAN: 'admin_script_url'
-  };
-  return map[String(key || '').trim().toUpperCase()] || 'app_storage';
+function cleanupDuplicateRowsOnce() {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('DEDUP_DONE_V2') === '1') return;
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const ss = getSpreadsheet();
+    Object.keys(SHEET_MAP).forEach(key => {
+      const sh = ss.getSheetByName(SHEET_MAP[key]);
+      if (sh) {
+        ensureSheetHeader(sh);
+        dedupeRowsInSheet(sh);
+      }
+    });
+    SpreadsheetApp.flush();
+    props.setProperty('DEDUP_DONE_V2', '1');
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function loadAllSheets() {
   const ss = getSpreadsheet();
-  const sheets = ss.getSheets();
-  const out = [];
-  sheets.forEach(sh => {
-    const name = sh.getName();
-    const rows = loadSheetRows(name);
-    out.push({ sheet: name, rows });
-  });
-  return out;
+  return ss.getSheets().map(sh => ({
+    sheet: sh.getName(),
+    rows: loadSheetRows(sh.getName())
+  }));
 }
 
 function loadSheetRows(sheetName) {
   const ss = getSpreadsheet();
   const sh = ss.getSheetByName(sheetName);
-  if (!sh) return [];
+  if (!sh || sh.getLastRow() < 1) return [];
+
   const values = sh.getDataRange().getValues();
   if (!values.length) return [];
 
-  const firstRow = values[0] || [];
-  const isHeaderRow = String(firstRow[0] || '').toLowerCase() === 'source_key';
-  const dataRows = isHeaderRow ? values.slice(1) : values;
+  const first = values[0] || [];
+  const isHeader = String(first[0] || '').trim() === 'source_key';
+  const rows = isHeader ? values.slice(1) : values;
 
-  return dataRows.map(row => ({
-    source_key: row[0] || '',
-    record_id: row[1] || '',
-    data_json: row[2] || '',
-    updated_at: row[3] || ''
-  })).filter(r => String(r.source_key || r.record_id || r.data_json || '').trim() !== '');
+  const seen = new Set();
+  const out = [];
+  rows.forEach(row => {
+    const item = {
+      source_key: row[0] || '',
+      record_id: row[1] || '',
+      data_json: row[2] || '',
+      updated_at: row[3] || ''
+    };
+    if (!String(item.source_key || item.record_id || item.data_json || '').trim()) return;
+    const fp = rowFingerprint(item.source_key, item.record_id || digestId(item.data_json));
+    if (seen.has(fp)) return;
+    seen.add(fp);
+    out.push(item);
+  });
+  return out;
+}
+
+function stableStringify(value) {
+  if (value === null || value === undefined) return String(value);
+  if (typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+  return '{' + Object.keys(value).sort().map(k => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
+}
+
+function digestId(value) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, String(value), Utilities.Charset.UTF_8);
+  return bytes.map(b => {
+    const n = b < 0 ? b + 256 : b;
+    return ('0' + n.toString(16)).slice(-2);
+  }).join('');
+}
+
+function getRecordId(item) {
+  if (item && typeof item === 'object' && !Array.isArray(item)) {
+    const keys = ['id', 'noSurat', 'username', 'roomId', 'messageId', 'key', 'code', 'record_id'];
+    for (let i = 0; i < keys.length; i++) {
+      const v = item[keys[i]];
+      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+    }
+  }
+  return 'hash-' + digestId(stableStringify(item));
+}
+
+function parseEntryItems(value) {
+  if (Array.isArray(value)) return value;
+  if (value === undefined || value === null) return [];
+  return [value];
+}
+
+function rowFingerprint(sourceKey, recordId) {
+  return String(sourceKey || '').trim() + '::' + String(recordId || '').trim();
+}
+
+function dedupeRowsInSheet(sh) {
+  if (sh.getLastRow() <= 2) return;
+  const values = sh.getRange(2, 1, sh.getLastRow() - 1, 4).getValues();
+  const seen = new Set();
+  const deleteRows = [];
+
+  values.forEach((row, index) => {
+    const sourceKey = String(row[0] || '').trim();
+    const recordId = String(row[1] || '').trim();
+    if (!sourceKey || !recordId) return;
+    const fp = rowFingerprint(sourceKey, recordId);
+    if (seen.has(fp)) deleteRows.push(index + 2);
+    else seen.add(fp);
+  });
+
+  deleteRows.reverse().forEach(rowNum => sh.deleteRow(rowNum));
+}
+
+function findRowsByIdentity(sh, key, recordId) {
+  if (sh.getLastRow() <= 1) return [];
+  const values = sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues();
+  const out = [];
+  values.forEach((row, i) => {
+    const sourceKey = String(row[0] || '').trim();
+    const id = String(row[1] || '').trim();
+    if ((sourceKey === key && id === recordId) || id === recordId) out.push(i + 2);
+  });
+  return out;
 }
 
 function writeBatch(entries) {
+  if (!Array.isArray(entries) || !entries.length) return [];
+
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
+
   try {
     const ss = getSpreadsheet();
-  const result = [];
-  entries.forEach(ent => {
-    try {
-      const sheetName = ent.sheet || inferSheetName(ent.key);
-      const sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
-      const key = String(ent.key || '').trim();
-      if (!key) { result.push({ key: null, ok: false, reason: 'missing_key' }); return; }
-      const op = (ent.op || 'upsert').toString().toLowerCase();
+    const results = [];
 
-      ensureSheetHeader(sh);
-
-      if (op === 'delete') {
-        const lastRow = sh.getLastRow();
-        if (lastRow > 1) {
-          const dataRange = sh.getRange(2, 1, lastRow - 1, 2).getValues();
-          const rowsToDelete = [];
-          dataRange.forEach((row, index) => {
-            const rowKey = String(row[0] || '').trim();
-            const recordId = String(row[1] || '').trim();
-            if (rowKey === key || recordId === key) rowsToDelete.push(index + 2);
-          });
-          rowsToDelete.reverse().forEach(rowNum => sh.deleteRow(rowNum));
-        }
-        result.push({ key, ok: true, op: 'delete' });
+    entries.forEach(ent => {
+      const key = String(ent && ent.key || '').trim();
+      if (!key) {
+        results.push({ key: null, ok: false, reason: 'missing_key' });
         return;
       }
 
-      const now = ent.updated_at || new Date().toISOString();
-      const rawValue = ent.value;
-      const values = Array.isArray(rawValue)
-        ? rawValue
-        : (rawValue === undefined || rawValue === null ? [] : [rawValue]);
+      const sheetName = String(ent.sheet || SHEET_MAP[key] || 'app_storage').trim();
+      const sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+      ensureSheetHeader(sh);
 
-      if (op === 'replace' && sh.getLastRow() > 1) {
-        const rowsToDelete = Math.max(0, sh.getLastRow() - 1);
-        if (rowsToDelete > 0) sh.deleteRows(2, rowsToDelete);
+      const op = String(ent.op || 'upsert').toLowerCase().trim();
+      const now = ent.updated_at || new Date().toISOString();
+
+      if (op === 'delete') {
+        if (sh.getLastRow() > 1) {
+          const rows = sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues();
+          const deleteRows = [];
+          rows.forEach((row, i) => {
+            const sourceKey = String(row[0] || '').trim();
+            const recordId = String(row[1] || '').trim();
+            if (sourceKey === key || recordId === key) deleteRows.push(i + 2);
+          });
+          deleteRows.reverse().forEach(r => sh.deleteRow(r));
+        }
+        results.push({ key, sheet: sheetName, op: 'delete', ok: true });
+        return;
       }
 
-      values.forEach(item => {
-        if (item && typeof item === 'object' && !Array.isArray(item)) {
-          const recordId = String(item.id || item.noSurat || item.username || item.roomId || item.messageId || item.key || item.record_id || `${Date.now()}-${Math.random() * 1000}`);
-          let rowNum = null;
-
-          if (op === 'upsert' || op === 'append') {
-            rowNum = findExistingRowNumber(sh, key, recordId);
-          }
-
-          if (op === 'replace') {
-            sh.appendRow([key, recordId, JSON.stringify(item), now]);
-          } else if (op === 'upsert') {
-            if (rowNum) {
-              sh.getRange(rowNum, 1, 1, 4).setValues([[key, recordId, JSON.stringify(item), now]]);
-            } else {
-              sh.appendRow([key, recordId, JSON.stringify(item), now]);
-            }
-          } else if (op === 'append') {
-            if (!rowNum) {
-              sh.appendRow([key, recordId, JSON.stringify(item), now]);
-            }
-          } else {
-            sh.appendRow([key, recordId, JSON.stringify(item), now]);
-          }
-        } else {
-          const fallbackRecordId = (item && typeof item === 'string' && item.trim()) ? item : '';
-          sh.appendRow([key, fallbackRecordId, JSON.stringify(item), now]);
-        }
+      const items = parseEntryItems(ent.value);
+      const unique = new Map();
+      items.forEach(item => {
+        const recordId = getRecordId(item);
+        unique.set(recordId, item);
       });
 
-      dedupeSheetRows(sh, key);
-      result.push({ key, ok: true, op: op });
-    } catch (err) {
-      result.push({ key: ent.key || null, ok: false, reason: String(err) });
-    }
-  });
-    return result;
+      if (op === 'replace') {
+        const oldRows = Math.max(0, sh.getLastRow() - 1);
+        if (oldRows) sh.deleteRows(2, oldRows);
+
+        const output = Array.from(unique.entries()).map(([recordId, item]) => [
+          key,
+          recordId,
+          JSON.stringify(item),
+          now
+        ]);
+
+        if (output.length) {
+          sh.getRange(2, 1, output.length, 4).setValues(output);
+        }
+
+        results.push({ key, sheet: sheetName, op: 'replace', ok: true, count: output.length });
+        return;
+      }
+
+      if (op === 'upsert' || op === 'append') {
+        const lastRow = sh.getLastRow();
+        const existing = new Map();
+        if (lastRow > 1) {
+          const rows = sh.getRange(2, 1, lastRow - 1, 4).getValues();
+          rows.forEach((row, i) => {
+            const sourceKey = String(row[0] || '').trim();
+            const recordId = String(row[1] || '').trim();
+            if (!recordId) return;
+            if (!existing.has(rowFingerprint(sourceKey, recordId))) existing.set(rowFingerprint(sourceKey, recordId), i + 2);
+          });
+        }
+
+        const appendRows = [];
+        unique.forEach((item, recordId) => {
+          const fp = rowFingerprint(key, recordId);
+          const rowNum = existing.get(fp);
+          const rowValues = [[key, recordId, JSON.stringify(item), now]];
+
+          if (op === 'upsert' && rowNum) {
+            sh.getRange(rowNum, 1, 1, 4).setValues(rowValues);
+          } else if (!rowNum) {
+            appendRows.push(rowValues[0]);
+          }
+        });
+
+        if (appendRows.length) {
+          const start = sh.getLastRow() + 1;
+          sh.getRange(start, 1, appendRows.length, 4).setValues(appendRows);
+        }
+
+        dedupeRowsInSheet(sh);
+        results.push({ key, sheet: sheetName, op, ok: true, count: unique.size });
+        return;
+      }
+
+      results.push({ key, sheet: sheetName, op, ok: false, reason: 'unsupported_operation' });
+    });
+
+    SpreadsheetApp.flush();
+    return results;
   } finally {
     lock.releaseLock();
   }
@@ -306,47 +422,55 @@ function writeBatch(entries) {
 
 function uploadImageToDrive(base64str, filename) {
   const folderId = getScriptProp(PROP_FOLDER_ID);
-  if (!folderId) throw new Error('FOLDER_ID not configured in script properties');
+  if (!folderId) throw new Error('FOLDER_ID belum dikonfigurasi.');
   const contentType = detectContentTypeFromBase64(base64str) || 'image/jpeg';
-  if (!/^image\/(jpeg|png|gif|webp)$/i.test(contentType)) throw new Error('Tipe file gambar tidak didukung.');
-  const data = Utilities.base64Decode(base64str.replace(/^data:[^;]+;base64,/, ''));
-  const safeFilename = String(filename || ('FOTO_' + Date.now() + '.jpg')).replace(/[^a-zA-Z0-9._-]/g, '_');
-  const blob = Utilities.newBlob(data, contentType, safeFilename);
+  const clean = String(base64str).replace(/^data:[^;]+;base64,/, '');
+  const blob = Utilities.newBlob(Utilities.base64Decode(clean), contentType, filename);
   const folder = DriveApp.getFolderById(folderId);
   const file = folder.createFile(blob);
-  // make file viewable by anyone with link
-  try { file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); } catch (e) { /* ignore */ }
-  const url = 'https://drive.google.com/uc?export=view&id=' + file.getId();
-  return url;
+  try { file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); } catch (_) {}
+  return 'https://drive.google.com/uc?export=view&id=' + file.getId();
 }
 
-function detectContentTypeFromBase64(s) {
-  if (!s) return null;
-  const m = s.match(/^data:([^;]+);base64,/);
-  if (m && m[1]) return m[1];
-  return null;
+function detectContentTypeFromBase64(value) {
+  const m = String(value || '').match(/^data:([^;]+);base64,/);
+  return m ? m[1] : null;
 }
 
 function notifySubscribers(payload) {
-  try {
-    const subStr = getScriptProp(PROP_SUBSCRIBERS);
-    if (!subStr) return;
-    let subs = [];
-    try { subs = JSON.parse(subStr); } catch (e) { subs = [subStr]; }
-    subs.forEach(url => {
-      try {
-        UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true });
-      } catch (e) { /* ignore */ }
-    });
-  } catch (err) { /* ignore */ }
+  const raw = getScriptProp(PROP_SUBSCRIBERS);
+  if (!raw) return;
+  let urls = [];
+  try { urls = Array.isArray(JSON.parse(raw)) ? JSON.parse(raw) : [raw]; }
+  catch (_) { urls = [raw]; }
+  urls.filter(Boolean).forEach(url => {
+    try {
+      UrlFetchApp.fetch(String(url), {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      });
+    } catch (_) {}
+  });
 }
 
-// Helper to set script property (use from the Script Editor console)
-function setFolderId(id) { PropertiesService.getScriptProperties().setProperty(PROP_FOLDER_ID, id); }
-function setSubscribers(jsonArrayOrString) { PropertiesService.getScriptProperties().setProperty(PROP_SUBSCRIBERS, typeof jsonArrayOrString === 'string' ? jsonArrayOrString : JSON.stringify(jsonArrayOrString)); }
-
-// Optional onChange trigger to notify subscribers when spreadsheet changes
 function onChange(e) {
-  // e is change event object; notify subscribers that sheet changed
-  notifySubscribers({ event: 'sheet_changed', details: { changeType: e.changeType || null, authMode: e.authMode || null } });
+  notifySubscribers({
+    event: 'sheet_changed',
+    details: { changeType: e && e.changeType || null }
+  });
+}
+
+function setSpreadsheetId(id) {
+  PropertiesService.getScriptProperties().setProperty(PROP_SPREADSHEET_ID, String(id || '').trim());
+}
+
+function setFolderId(id) {
+  PropertiesService.getScriptProperties().setProperty(PROP_FOLDER_ID, String(id || '').trim());
+}
+
+function setSubscribers(value) {
+  const normalized = typeof value === 'string' ? value : JSON.stringify(value || []);
+  PropertiesService.getScriptProperties().setProperty(PROP_SUBSCRIBERS, normalized);
 }

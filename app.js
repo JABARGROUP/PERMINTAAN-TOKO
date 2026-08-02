@@ -1,6 +1,6 @@
 /* ======================================================
    PERMINTAAN BARANG TOKO
-   MASTER APPLICATION LOGIC & GOOGLE SHEETS DATABASE ENGINE
+   MASTER APPLICATION LOGIC & SUPABASE DATABASE ENGINE
 ====================================================== */
 
 // STORAGE KEYS (V7_HARD_RESET_CLEAN)
@@ -432,17 +432,36 @@ function formatDateDDMMYYYYString(input) {
 // APP INITIALIZATION
 // APP INITIALIZATION
 document.addEventListener('DOMContentLoaded', async () => {
-  // Load the endpoint first; otherwise the initial seed writes can be lost.
-  if (typeof loadSupabaseConfigFromJson === 'function') {
-    await loadSupabaseConfigFromJson().catch(() => {});
-  }
-
-  // Hydrate memory from Google Sheets before creating local defaults.
-  if (typeof initSupabaseDB === 'function') {
-    await initSupabaseDB().catch(() => {});
-  }
-
   initDatabase();
+
+  // Urutan wajib: config -> load Sheet -> baru sinkronisasi write.
+  try {
+    if (typeof loadSupabaseConfigFromJson === 'function') {
+      await loadSupabaseConfigFromJson();
+    }
+    if (typeof initSupabaseDB === 'function') {
+      await initSupabaseDB();
+    }
+  } catch (err) {
+    console.warn('Cloud initialization:', err.message);
+  }
+
+  // Seed hanya key yang memang belum ada di Google Sheets.
+  if (typeof seedSupabaseDefaults === 'function') {
+    await seedSupabaseDefaults({
+      [USERS_DB_KEY]: JSON.stringify([...SEED_USERS]),
+      [REQUESTS_DB_KEY]: JSON.stringify([]),
+      [CHAT_DB_KEY]: JSON.stringify([]),
+      [CHAT_ROOM_DB_KEY]: JSON.stringify([]),
+      [TTD_DB_KEY]: JSON.stringify({}),
+      [KODE_UNIT_MAP_KEY]: JSON.stringify({}),
+      [FEATURE_PHOTOS_KEY]: 'true',
+      [NOTIFICATIONS_DB_KEY]: JSON.stringify([]),
+      [DELETED_USERS_KEY]: JSON.stringify([]),
+      [STORES_DB_KEY]: JSON.stringify([])
+    });
+  }
+
   startCentralCloudSyncEngine();
   startSupabaseKeepalive();
   loadSavedTheme();
@@ -628,7 +647,7 @@ function checkAndTriggerPendingReminders() {
 }
 
 /* ======================================================
-   GOOGLE SHEETS CLOUD SYNC VIA APPS SCRIPT
+   SUPABASE CLOUD SYNC (MENGGANTIKAN CLOUDFLARE / FIREBASE)
    ====================================================== */
 let cloudSyncInterval = null;
 
@@ -672,6 +691,11 @@ function startCentralCloudSyncEngine() {
 }
 
 async function pullCentralCloudDB() {
+  // Jangan menarik data server saat ada write yang masih antre;
+  // ini mencegah perubahan lokal tertimpa sebelum tersimpan.
+  if (typeof window.hasPendingCloudWrites === 'function' && window.hasPendingCloudWrites()) {
+    return false;
+  }
   const ok = await pullFromSupabase();
   if (ok && currentUser) onSupabaseDataChange();
   return ok;
@@ -779,12 +803,49 @@ function clearAllAppCacheAndData(force = false) {
   }
 
   try {
-    if (typeof caches !== 'undefined' && typeof caches.keys === 'function') {
+    const keysToRemove = Object.keys(localStorage || {});
+    keysToRemove.forEach(key => {
+      if (String(key).startsWith('STORE_') || String(key).startsWith('FIREBASE_')) {
+        localStorage.removeItem(key);
+      }
+    });
+  } catch (err) {
+    console.warn('clearAllAppCacheAndData localStorage failed:', err);
+  }
+
+  try {
+    if (typeof caches !== 'undefined' && Array.isArray(caches)) {
       caches.keys().then(names => names.forEach(n => caches.delete(n))).catch(() => {});
     }
   } catch (err) {
     console.warn('clearAllAppCacheAndData caches failed:', err);
   }
+
+  const sessionKeys = [
+    SESSION_KEY,
+    THEME_KEY,
+    USERS_DB_KEY,
+    REQUESTS_DB_KEY,
+    CHAT_DB_KEY,
+    CHAT_ROOM_DB_KEY,
+    TTD_DB_KEY,
+    STORES_DB_KEY,
+    DELETED_STORES_KEY,
+    NOTIFICATIONS_DB_KEY,
+    KODE_UNIT_MAP_KEY,
+    FEATURE_PHOTOS_KEY,
+    DELETED_REQUESTS_KEY,
+    DELETED_USERS_KEY,
+    FONTE_TOKEN_KEY,
+    ADMIN_REMINDER_KEY,
+    ADMIN_SECRET_KEY_STORAGE_KEY,
+    ADMIN_SCRIPT_URL_STORAGE_KEY
+  ];
+
+  sessionKeys.forEach(key => {
+    try { localStorage.removeItem(key); } catch (err) {}
+    try { window.appStorage?.removeItem?.(key); } catch (err) {}
+  });
 
   if (window.appStorage) {
     window.appStorage.setItem(USERS_DB_KEY, JSON.stringify([...SEED_USERS]));
@@ -947,17 +1008,14 @@ function upsertCollectionItem(storageKey, item, identityKey) {
 }
 
 function triggerCloudSyncForKey(storageKey, value) {
-  if (typeof pushCentralCloudDB === 'function') {
-    try {
-      const sheetName = typeof mapStorageKeyToSheetName === 'function' ? mapStorageKeyToSheetName(storageKey) : null;
-      if (sheetName) {
-        const payload = Array.isArray(value) ? value : [value];
-        pendingWrites.set(storageKey, { __OP__: 'replace', items: payload });
-      }
-      pushCentralCloudDB();
-    } catch (err) {
-      console.warn('Cloud sync trigger failed:', err);
+  try {
+    if (typeof window.queueCloudWrite === 'function') {
+      window.queueCloudWrite(storageKey, value);
+    } else if (typeof pushCentralCloudDB === 'function') {
+      pushCentralCloudDB().catch(() => {});
     }
+  } catch (err) {
+    console.warn('Cloud sync trigger failed:', err);
   }
 }
 
@@ -1333,13 +1391,7 @@ function getAccessibleRequests() {
   }
 
   if (currentUser.category === 'TOKO') {
-    const currentStoreName = String(currentUser.fullName || '').trim().toUpperCase();
-    return requests.filter(r => {
-      const requestUserId = String(r.userId || '').trim();
-      const requestStoreName = String(r.toko || '').trim().toUpperCase();
-      return requestUserId === String(currentUser.id || '').trim()
-        || (currentStoreName && requestStoreName === currentStoreName);
-    });
+    return requests.filter(r => r.userId === currentUser.id || r.toko.toUpperCase() === currentUser.fullName.toUpperCase() || r.area === currentUser.area);
   }
 
   // All SERVICE users (including TSM) and SALES are scoped strictly to their own area
@@ -1421,11 +1473,9 @@ function bukaDetailDariDashboard(noSurat) {
 
 // DYNAMIC FORM MULTI-ROW ENGINE WITH CAMERA SCANNER TOOL IN EVERY SERIAL COLUMN
 function loadForm() {
-  const tanggalEl = document.getElementById('tanggal');
-  const tokoSelect = document.getElementById('toko');
-  if (!currentUser || !tokoSelect) return;
+  document.getElementById('tanggal').value = getFormattedDateDDMMYYYY();
 
-  if (tanggalEl) tanggalEl.value = getFormattedDateDDMMYYYY();
+  const tokoSelect = document.getElementById('toko');
   tokoSelect.innerHTML = '';
 
   if (currentUser.category === 'TOKO') {
@@ -1435,22 +1485,22 @@ function loadForm() {
     currentUser.category === 'DM' ||
     (currentUser.username && currentUser.username.toUpperCase() === 'ADMIN')
   ) {
+    // ADMIN & DM can select all stores across all areas
     const allStores = getStoresFromDB();
     if (allStores.length > 0) {
       allStores.forEach(s => {
-        const label = `${String(s.fullName || '').trim()} (${String(s.area || '').trim()})`;
-        tokoSelect.add(new Option(label, String(s.fullName || '').trim()));
+        tokoSelect.innerHTML += `<option value="${s.fullName}">${s.fullName} (${s.area})</option>`;
       });
     } else {
       tokoSelect.innerHTML = `<option value="TOKO SINAR ABADI">TOKO SINAR ABADI (BDG)</option>`;
     }
   } else {
+    // Service & Sales dibatasi khusus area user sendiri
     const allStores = getStoresFromDB();
     const areaStores = allStores.filter(s => s.area === currentUser.area);
     if (areaStores.length > 0) {
       areaStores.forEach(s => {
-        const label = `${String(s.fullName || '').trim()} (${String(s.area || '').trim()})`;
-        tokoSelect.add(new Option(label, String(s.fullName || '').trim()));
+        tokoSelect.innerHTML += `<option value="${s.fullName}">${s.fullName} (${s.area})</option>`;
       });
     } else {
       tokoSelect.innerHTML = `<option value="TOKO SINAR ABADI">TOKO SINAR ABADI (${currentUser.area})</option>`;
@@ -1463,6 +1513,50 @@ function loadForm() {
     bersihkanForm();
   }
 }
+
+// PLAIN TEXT STATUS WITH ROLE-BASED CONDITIONAL LABELS
+function getBadgeStatus(r) {
+  if (typeof r === 'string') {
+    if (r === 'DONE') return '<span>SUDAH DIPENUHI</span>';
+    return `<span>${r}</span>`;
+  }
+
+  if (!r) return '<span>-</span>';
+
+  const role = currentUser ? currentUser.category : '';
+  const st = r.status;
+  const serviceAppv = r.serviceApprove;
+
+  if (st === 'DONE') {
+    return '<span>SUDAH DIPENUHI</span>';
+  }
+
+  if (st === 'REJECT') {
+    return '<span>DITOLAK</span>';
+  }
+
+  if (st === 'APPROVE') {
+    return '<span>DISETUJUI</span>';
+  }
+
+  if (st === 'PENDING') {
+    if (!serviceAppv) {
+      if (role === 'DM') {
+        return '<span>TUNGGU SERVICE</span>';
+      }
+      return '<span>TUNGGU SERVICE</span>';
+    } else {
+      if (role === 'SERVICE' || role === 'TOKO' || role === 'SALES') {
+        return '<span>TUNGGU DM</span>';
+      }
+      return '<span>TUNGGU APPROVAL DM</span>';
+    }
+  }
+
+  return `<span>${st}</span>`;
+}
+
+// DYNAMIC FORM MULTI-ROW ENGINE WITH CAMERA SCANNER TOOL IN EVERY SERIAL COLUMN
 function gantiJenis() {
   const container = document.getElementById('detailContainer');
   if (container.children.length > 0 && !modeEdit) {
@@ -1867,6 +1961,30 @@ function simpanData() {
   }
 }
 
+function generateUniqueRequestNumber(requests, area, storeCode, now) {
+  const yy = String(now.getFullYear()).slice(-2);
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const prefix = `PRMT/${area}-${storeCode}/${yy}${mm}${dd}`;
+
+  let maxSeq = 0;
+  (Array.isArray(requests) ? requests : []).forEach(r => {
+    const no = String(r && r.noSurat || '');
+    if (!no.startsWith(prefix)) return;
+    const match = no.match(/(\d+)$/);
+    if (match) maxSeq = Math.max(maxSeq, parseInt(match[1], 10) || 0);
+  });
+
+  let seq = maxSeq + 1;
+  let candidate = `${prefix}${String(seq).padStart(2, '0')}`;
+  const existing = new Set((requests || []).map(r => String(r && r.noSurat || '')));
+  while (existing.has(candidate)) {
+    seq += 1;
+    candidate = `${prefix}${String(seq).padStart(2, '0')}`;
+  }
+  return candidate;
+}
+
 function prosesSimpanKeDB(toko, jenis, catatan, items) {
   showLoading('MENYIMPAN DATA...');
   setTimeout(() => {
@@ -1887,17 +2005,13 @@ function prosesSimpanKeDB(toko, jenis, catatan, items) {
       }
     } else {
       const now = new Date();
-      const codeYear = String(now.getFullYear()).slice(-2);
-      const codeMonth = String(now.getMonth() + 1).padStart(2, '0');
-      const codeDay = String(now.getDate()).padStart(2, '0');
 
       const allStores = getStoresFromDB();
       const safeToko = String(toko || '').trim().toUpperCase();
       const matchedStore = allStores.find(s => s && s.fullName && String(s.fullName).trim().toUpperCase() === safeToko);
       let storeCode = matchedStore ? (matchedStore.storeCode || generateStoreCode(matchedStore.fullName)) : generateStoreCode(safeToko);
 
-      const seqNo = String(requests.length + 1).padStart(2, '0');
-      const noSurat = `PRMT/${currentUser.area}-${storeCode}/${codeYear}${codeMonth}${codeDay}${seqNo}`;
+      const noSurat = generateUniqueRequestNumber(requests, currentUser.area, storeCode, now);
       
       const newRecord = {
         noSurat,

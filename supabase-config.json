@@ -1,0 +1,6 @@
+{
+  "SUPABASE_URL": "https://ducrykojvabaoioigbgc.supabase.co",
+  "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_H2w50rrXQWKqZM2fKZJXBw_sRsEpwNf",
+  "SUPABASE_SECRET_KEY": "your-secret-key",
+  "SUPABASE_JWKS_URL": "https://ducrykojvabaoioigbgc.supabase.co/auth/v1/.well-known/jwks.json"
+}

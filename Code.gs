@@ -90,8 +90,11 @@ function doGet(e) {
         time: new Date().toISOString()
       };
     } else if (action === 'loadall') {
-      cleanupDuplicateRowsOnce();
+      // READ MUST BE FAST. Do not run repair/dedup during every page load.
       payload = { success: true, ok: true, data: loadAllSheets() };
+    } else if (action === 'repair') {
+      cleanupDuplicateRowsOnce();
+      payload = { success: true, ok: true, repaired: true, data: loadAllSheets() };
     } else if (action === 'loadsheet') {
       const sheet = String(p.sheet || '').trim();
       if (!sheet) throw new Error('sheet wajib diisi');

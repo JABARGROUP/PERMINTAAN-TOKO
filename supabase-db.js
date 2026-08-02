@@ -27,7 +27,7 @@ let cloudLoadedKeys = new Set();
 let cloudRowCounts = new Map();
 let jsonpCounter = 0;
 const PUSH_SUPPRESS_MS = 1500;
-const WRITE_RETRY_MS = 2500;
+const WRITE_RETRY_MS = 5000;
 
 const SCALAR_KEYS = new Set([
   'STORE_FEATURE_PHOTOS_V7_CLEAN',
@@ -162,7 +162,7 @@ function getCloudEndpoint() {
 
 async function loadSupabaseConfigFromJson() {
   try {
-    const resp = await fetch('./sheets-config.json?v=20260802-final', { cache: 'no-store' });
+    const resp = await fetch('./sheets-config.json?v=20260802-proxy-v3', { cache: 'no-store' });
     if (!resp.ok) throw new Error('CONFIG_HTTP_' + resp.status);
     const cfg = await resp.json();
     if (cfg && cfg.SHEETS_ENDPOINT) window.APP_SHEETS_ENDPOINT = String(cfg.SHEETS_ENDPOINT).trim();
@@ -182,7 +182,7 @@ function mapSheetNameToStorageKey(sheetName) {
   return SHEET_TO_STORAGE[String(sheetName || '').trim().toLowerCase()] || null;
 }
 
-function jsonpGet(url, timeoutMs = 15000) {
+function jsonpGet(url, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
     const callbackName = '__sheetsProxyCallback_' + Date.now() + '_' + (++jsonpCounter);
     const script = document.createElement('script');
@@ -196,8 +196,13 @@ function jsonpGet(url, timeoutMs = 15000) {
     const timer = setTimeout(() => {
       if (finished) return;
       finished = true;
-      cleanup();
+      // Apps Script can be slow on the first request. Keep the callback briefly
+      // so a late JSONP response does not become "callback is not defined".
       reject(new Error('JSONP timeout'));
+      setTimeout(() => {
+        try { delete window[callbackName]; } catch (_) { window[callbackName] = undefined; }
+        if (script.parentNode) script.parentNode.removeChild(script);
+      }, 120000);
     }, timeoutMs);
 
     window[callbackName] = payload => {
